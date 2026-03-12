@@ -42,16 +42,13 @@ def ensure_home():
 # ── ANSI helpers ──
 
 def _info(msg: str):
-    sys.stderr.write(f"\033[35m[procy]\033[0m {msg}\n")
-    sys.stderr.flush()
+    os.write(sys.stdout.fileno(), f"\033[35m[procy]\033[0m {msg}\r\n".encode())
 
 def _dim(msg: str):
-    sys.stderr.write(f"\033[2m  {msg}\033[0m\n")
-    sys.stderr.flush()
+    os.write(sys.stdout.fileno(), f"\033[2m  {msg}\033[0m\r\n".encode())
 
 def _err(msg: str):
-    sys.stderr.write(f"\033[31m[procy]\033[0m {msg}\n")
-    sys.stderr.flush()
+    os.write(sys.stdout.fileno(), f"\033[31m[procy]\033[0m {msg}\r\n".encode())
 
 
 # ── SSH Tunnel ──
@@ -177,6 +174,10 @@ class Procy:
         self._captured_output = b""
         self._saved_terminal = None
 
+    def _echo(self, text: str):
+        """Echo text directly to the real terminal (bypasses PTY, works in raw mode)."""
+        os.write(sys.stdout.fileno(), text.encode("utf-8"))
+
     def _on_input(self, data: bytes) -> bytes | None:
         self._input_buffer += data
 
@@ -186,10 +187,8 @@ class Procy:
             self._input_buffer = b""
 
             if line.startswith("!"):
-                # Procy command — already swallowed keystrokes, now handle
-                # Print newline to move past the echoed "!command" text
-                sys.stderr.write("\r\n")
-                sys.stderr.flush()
+                # Procy command — we swallowed keystrokes while typing
+                self._echo("\r\n")
                 self._handle_command(line)
                 return b""  # swallow the Enter too
 
@@ -212,27 +211,21 @@ class Procy:
                     if text:
                         text = text[:-1]  # remove char before it
                     self._input_buffer = text.encode("utf-8")
-                    # Erase character on screen: backspace + space + backspace
-                    sys.stderr.write("\b \b")
-                    sys.stderr.flush()
+                    self._echo("\b \b")
                 else:
                     # Backspaced past '!' — clear buffer, nothing to send
                     self._input_buffer = b""
-                    sys.stderr.write("\b \b")
-                    sys.stderr.flush()
+                    self._echo("\b \b")
                 return b""  # swallow
 
             # Handle Ctrl-C: cancel the ! command
             if data == b"\x03":
                 self._input_buffer = b""
-                sys.stderr.write("^C\r\n")
-                sys.stderr.flush()
+                self._echo("^C\r\n")
                 return b""  # swallow
 
-            # Echo the character locally (agent doesn't see it)
-            ch = data.decode("utf-8", errors="replace")
-            sys.stderr.write(ch)
-            sys.stderr.flush()
+            # Echo the character directly to terminal (agent doesn't see it)
+            self._echo(data.decode("utf-8", errors="replace"))
             return b""  # swallow — don't send to agent
 
         return None  # not a ! command, pass through normally
@@ -435,8 +428,7 @@ class Procy:
         if self.qwen_url:
             _dim(f"qwen: {self.qwen_url}")
         _dim("type !help for procy commands")
-        sys.stderr.write("─" * 60 + "\n")
-        sys.stderr.flush()
+        os.write(sys.stdout.fileno(), ("─" * 60 + "\r\n").encode())
 
         import termios
         if sys.stdin.isatty():
