@@ -140,6 +140,20 @@ def api_terminal(session_id):
     return jsonify({"events": out, "count": len(out)})
 
 
+@app.route("/api/evaluator/<session_id>")
+def api_evaluator(session_id):
+    ev = store.get_evaluator(session_id)
+    if not ev:
+        return jsonify(None)
+    return jsonify(ev)
+
+
+@app.route("/api/eval-results/<session_id>")
+def api_eval_results(session_id):
+    results = store.get_eval_results(session_id)
+    return jsonify(results)
+
+
 @app.route("/api/training")
 def api_training():
     pairs = store.get_training_pairs()
@@ -858,18 +872,58 @@ INDEX_HTML = r"""<!doctype html>
     function renderEvolve() {
       const el=document.getElementById('details');
       if(!state.selectedId) { el.innerHTML='<div class="content muted">Select a session.</div>'; return; }
-      apiGet('/api/evolves/'+state.selectedId).then(r=>r.json()).then(evolves => {
+      Promise.all([
+        apiGet('/api/evolves/'+state.selectedId).then(r=>r.json()),
+        apiGet('/api/evaluator/'+state.selectedId).then(r=>r.json()),
+        apiGet('/api/eval-results/'+state.selectedId).then(r=>r.json()),
+      ]).then(([evolves, evaluator, evalResults]) => {
+        let html='<div class="content">';
+
+        // Evaluator info
+        if(evaluator) {
+          const schema = evaluator.metrics_schema || [];
+          const metricNames = schema.map(m => `${m.name} (${m.goal||'maximize'})`).join(', ');
+          html+=`<div style="margin-bottom:12px;padding:10px;border:1px solid #e0d4f0;border-radius:8px;background:#faf8ff">
+            <div class="row"><b>Evaluator: ${esc(evaluator.name)}</b><span class="small muted">${esc(evaluator.created_by||'')}</span></div>
+            <div class="small muted" style="margin-top:4px">Script: ${esc(evaluator.script_path||'inline')}</div>
+            ${metricNames ? `<div class="small" style="margin-top:2px">Metrics: ${esc(metricNames)}</div>` : ''}
+          </div>`;
+        } else {
+          html+='<div class="small muted" style="margin-bottom:12px">No evaluator set. Use <code>!eval set &lt;path&gt;</code> in procy.</div>';
+        }
+
+        // Eval results chart (simple text grid)
+        if(evalResults.length) {
+          const metricKeys = new Set();
+          evalResults.forEach(er => { if(er.metrics && typeof er.metrics==='object') Object.keys(er.metrics).forEach(k => metricKeys.add(k)); });
+          const keys = [...metricKeys];
+          html+=`<div style="margin-bottom:12px"><b>Results Grid</b>
+            <table class="train-table" style="margin-top:6px"><thead><tr><th>#</th>${keys.map(k=>`<th>${esc(k)}</th>`).join('')}<th>Time</th></tr></thead><tbody>`;
+          evalResults.forEach(er => {
+            const tag = er.iteration!==null&&er.iteration!==undefined ? er.iteration : '-';
+            const m = (er.metrics && typeof er.metrics==='object') ? er.metrics : {};
+            html+=`<tr><td>${tag}</td>${keys.map(k=>`<td>${m[k]!==undefined?Number(m[k]).toFixed(4):'-'}</td>`).join('')}<td>${er.duration_s?Number(er.duration_s).toFixed(1)+'s':'-'}</td></tr>`;
+          });
+          html+='</tbody></table></div>';
+        }
+
         if(!evolves.length) {
-          el.innerHTML='<div class="content muted">No evolve runs in this session. Use <code>!evolve N</code> in procy.</div>';
+          html+='<div class="muted">No evolve runs yet. Use <code>!evolve N</code> in procy.</div>';
+          html+='</div>';
+          el.innerHTML=html;
           return;
         }
-        let html='<div class="content">';
-        html+=`<div class="row" style="margin-bottom:12px"><b>Evolve Tries (${evolves.length})</b></div>`;
-        html+='<div style="max-height:calc(100vh - 240px);overflow-y:auto;padding-right:4px">';
+        html+=`<div class="row" style="margin-bottom:8px"><b>Evolve Tries (${evolves.length})</b></div>`;
+        html+='<div style="max-height:calc(100vh - 400px);overflow-y:auto;padding-right:4px">';
+
+        // Match eval results to evolve iterations
+        const evalByIter = {};
+        evalResults.forEach(er => { if(er.iteration!==null) evalByIter[er.iteration]=er; });
+
         evolves.forEach(ev => {
           const tag='#'+ev.iteration;
           const scoreHtml=ev.score!==null&&ev.score!==undefined
-            ? `<span class="pill ok">${ev.score}</span>`
+            ? `<span class="pill ok">${Number(ev.score).toFixed(4)}</span>`
             : '<span class="pill muted">no score</span>';
           const resp=cleanTraceText(ev.response_summary||'');
           const respExcerpt=resp.length>300?resp.slice(0,300)+'...':resp;
@@ -895,7 +949,16 @@ INDEX_HTML = r"""<!doctype html>
           } else {
             html+='<div class="small muted">No response captured</div>';
           }
-          if(ev.eval_result) {
+          // Show eval metrics inline
+          const er = evalByIter[ev.iteration];
+          if(er && er.metrics && typeof er.metrics==='object') {
+            const mStr = Object.entries(er.metrics).map(([k,v])=>`${k}=${typeof v==='number'?v.toFixed(4):v}`).join(', ');
+            html+=`<div style="margin-top:6px"><div class="small muted" style="margin-bottom:2px">Eval Metrics</div><pre class="edge-text" style="max-height:80px;background:#edf8f1;border:1px solid #c8e6d0;border-radius:6px;padding:6px">${esc(mStr)}</pre></div>`;
+            if(er.trace_metrics) {
+              const tStr = typeof er.trace_metrics==='object' ? JSON.stringify(er.trace_metrics) : String(er.trace_metrics);
+              html+=`<div style="margin-top:4px"><div class="small muted" style="margin-bottom:2px">Trace Metrics</div><pre class="edge-text" style="max-height:60px;background:#f0f4f8;border:1px solid #d0d8e0;border-radius:6px;padding:6px;font-size:10px">${esc(tStr)}</pre></div>`;
+            }
+          } else if(ev.eval_result) {
             html+=`<div style="margin-top:6px"><div class="small muted" style="margin-bottom:2px">Eval Result</div><pre class="edge-text" style="max-height:80px;background:#edf8f1;border:1px solid #c8e6d0;border-radius:6px;padding:6px">${esc(typeof ev.eval_result==='string'?ev.eval_result:JSON.stringify(ev.eval_result,null,2))}</pre></div>`;
           }
           html+='</div>';

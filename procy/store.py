@@ -90,6 +90,33 @@ class TraceStore:
                     timestamp REAL NOT NULL,
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
+                CREATE TABLE IF NOT EXISTS evaluators (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    name TEXT NOT NULL,           -- human-readable name
+                    script_path TEXT,             -- path to evaluator script
+                    script_content TEXT,          -- inline script content (if no path)
+                    run_command TEXT,             -- how to run: "python3 {script}" etc.
+                    metrics_schema TEXT,          -- JSON: [{"name":"recall","type":"float","goal":"maximize"}, ...]
+                    created_by TEXT DEFAULT 'human',  -- 'human' or 'claude'
+                    timestamp REAL NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                );
+                CREATE TABLE IF NOT EXISTS eval_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    evaluator_id INTEGER NOT NULL,
+                    evolve_run_id INTEGER,        -- links to evolve_runs.id (null if manual run)
+                    iteration INTEGER,
+                    metrics TEXT NOT NULL,         -- JSON: {"recall": 0.95, "qps": 1200, ...}
+                    raw_output TEXT,               -- full stdout from evaluator
+                    exit_code INTEGER,
+                    duration_s REAL,
+                    trace_metrics TEXT,            -- JSON: metrics computed from procy traces
+                    timestamp REAL NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id),
+                    FOREIGN KEY(evaluator_id) REFERENCES evaluators(id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_turns_session_turn
                     ON turns(session_id, turn_num, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_actions_session_turn
@@ -520,3 +547,141 @@ class TraceStore:
 
         results.sort(key=lambda x: x.get("timestamp", 0))
         return results
+
+    # ── Evaluators ──
+
+    def set_evaluator(
+        self, session_id: str, name: str,
+        script_path: str | None = None,
+        script_content: str | None = None,
+        run_command: str | None = None,
+        metrics_schema: list[dict] | None = None,
+        created_by: str = "human",
+    ) -> int:
+        """Create or update the evaluator for a session."""
+        schema_json = json.dumps(metrics_schema) if metrics_schema else None
+        with self._conn() as c:
+            # Upsert: one evaluator per session (replace if exists)
+            c.execute(
+                "DELETE FROM evaluators WHERE session_id=? AND name=?",
+                (session_id, name),
+            )
+            c.execute(
+                """INSERT INTO evaluators
+                   (session_id, name, script_path, script_content, run_command,
+                    metrics_schema, created_by, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, name, script_path, script_content, run_command,
+                 schema_json, created_by, time.time()),
+            )
+            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_evaluator(self, session_id: str, name: str | None = None) -> dict | None:
+        """Get the evaluator for a session (latest if no name given)."""
+        with self._conn() as c:
+            if name:
+                row = c.execute(
+                    "SELECT * FROM evaluators WHERE session_id=? AND name=? ORDER BY id DESC LIMIT 1",
+                    (session_id, name),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT * FROM evaluators WHERE session_id=? ORDER BY id DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            if row:
+                d = dict(row)
+                if d.get("metrics_schema"):
+                    try:
+                        d["metrics_schema"] = json.loads(d["metrics_schema"])
+                    except json.JSONDecodeError:
+                        pass
+                return d
+            return None
+
+    def list_evaluators(self, session_id: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM evaluators WHERE session_id=? ORDER BY timestamp",
+                (session_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_evaluator_metrics_schema(self, evaluator_id: int, metrics_schema: list[dict]) -> None:
+        schema_json = json.dumps(metrics_schema) if metrics_schema else None
+        with self._conn() as c:
+            c.execute(
+                "UPDATE evaluators SET metrics_schema=?, timestamp=? WHERE id=?",
+                (schema_json, time.time(), evaluator_id),
+            )
+
+    def log_eval_result(
+        self, session_id: str, evaluator_id: int,
+        metrics: dict, raw_output: str = "",
+        exit_code: int = 0, duration_s: float = 0,
+        trace_metrics: dict | None = None,
+        evolve_run_id: int | None = None,
+        iteration: int | None = None,
+    ) -> int:
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO eval_results
+                   (session_id, evaluator_id, evolve_run_id, iteration,
+                    metrics, raw_output, exit_code, duration_s,
+                    trace_metrics, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, evaluator_id, evolve_run_id, iteration,
+                 json.dumps(metrics), raw_output, exit_code, duration_s,
+                 json.dumps(trace_metrics) if trace_metrics else None,
+                 time.time()),
+            )
+            return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_eval_results(self, session_id: str, evaluator_id: int | None = None) -> list[dict]:
+        with self._conn() as c:
+            if evaluator_id:
+                rows = c.execute(
+                    "SELECT * FROM eval_results WHERE session_id=? AND evaluator_id=? ORDER BY timestamp",
+                    (session_id, evaluator_id),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM eval_results WHERE session_id=? ORDER BY timestamp",
+                    (session_id,),
+                ).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                for key in ("metrics", "trace_metrics"):
+                    if d.get(key):
+                        try:
+                            d[key] = json.loads(d[key])
+                        except json.JSONDecodeError:
+                            pass
+                results.append(d)
+            return results
+
+    def get_eval_history_for_prompt(self, session_id: str) -> list[dict]:
+        """Get eval results with evolve iteration info, for feeding to proxy model."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT er.*, e.name AS evaluator_name,
+                      ev.prompt AS evolve_prompt, ev.source AS evolve_source
+                   FROM eval_results er
+                   JOIN evaluators e ON e.id = er.evaluator_id
+                   LEFT JOIN evolve_runs ev ON ev.id = er.evolve_run_id
+                   WHERE er.session_id = ?
+                   ORDER BY er.timestamp""",
+                (session_id,),
+            ).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                for key in ("metrics", "trace_metrics"):
+                    if d.get(key):
+                        try:
+                            d[key] = json.loads(d[key])
+                        except json.JSONDecodeError:
+                            pass
+                results.append(d)
+            return results

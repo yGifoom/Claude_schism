@@ -15,6 +15,7 @@ import atexit
 import json
 import os
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -322,7 +323,10 @@ class Procy:
         self.last_human_prompt: str = ""
         self._command_mode = False
         self._command_buffer = ""
-        self._command_esc_mode = False
+        self._command_cursor = 0  # cursor position within buffer
+        self._command_esc_mode = 0  # 0=none, 1=after ESC, 2=CSI, 3=OSC, 4=OSC_ESC
+        self._command_csi_buf = ""
+        self._command_in_paste = False
         self._evolving = False
         self._stop_evolve = False
         self._proxy: ProxySession | None = None
@@ -350,6 +354,7 @@ class Procy:
         self._evolve_progress = (0, 0)
         self._evolve_note = ""
         self._evolve_response_buf = ""  # captures agent output during evolve iteration
+        self._eval_autoset_generation = 0
 
     def _echo(self, text: str):
         """Echo text directly to the real terminal (bypasses PTY, works in raw mode)."""
@@ -365,11 +370,14 @@ class Procy:
                 not self._typed_line_buffer
                 and data
                 and data[0] == ord("!")
-                and self._can_enter_command_mode_locked()
             ):
                 self._command_mode = True
                 self._command_buffer = ""
-                self._command_esc_mode = False
+                self._command_cursor = 0
+                self._command_esc_mode = 0
+                self._command_csi_buf = ""
+                self._command_in_paste = False
+                self._echo("\033[?25h")  # show cursor (Claude TUI hides it)
                 return self._handle_command_mode_input(data)
             if self.session_id and data:
                 try:
@@ -529,61 +537,169 @@ class Procy:
         return text
 
     def _handle_command_mode_input(self, data: bytes) -> bytes:
+        needs_render = False
         for byte in data:
-            if self._command_esc_mode:
-                # Swallow escape-sequence bytes (arrow keys, delete, etc.)
-                if 64 <= byte <= 126:
-                    self._command_esc_mode = False
+            # ── Escape sequence state machine ──
+            if self._command_esc_mode == 1:  # after ESC
+                if byte == ord("["):
+                    self._command_esc_mode = 2  # CSI
+                    self._command_csi_buf = ""
+                elif byte == ord("O"):
+                    self._command_esc_mode = 2  # SS3 (same handling)
+                    self._command_csi_buf = ""
+                elif byte == ord("]"):
+                    self._command_esc_mode = 3  # OSC
+                else:
+                    self._command_esc_mode = 0
+                continue
+            if self._command_esc_mode == 2:  # CSI: params then final byte
+                if byte < 64:  # parameter/intermediate bytes
+                    self._command_csi_buf += chr(byte)
+                    if len(self._command_csi_buf) > 16:
+                        self._command_csi_buf = self._command_csi_buf[-16:]
+                    continue
+                if 64 <= byte <= 126:  # final byte
+                    seq = self._command_csi_buf + chr(byte)
+                    if seq == "200~":
+                        self._command_in_paste = True
+                    elif seq == "201~":
+                        self._command_in_paste = False
+                        needs_render = True
+                    elif seq == "D":  # Left arrow
+                        if self._command_cursor > 0:
+                            self._command_cursor -= 1
+                            needs_render = True
+                    elif seq == "C":  # Right arrow
+                        if self._command_cursor < len(self._command_buffer):
+                            self._command_cursor += 1
+                            needs_render = True
+                    elif seq in ("H", "1~"):  # Home
+                        self._command_cursor = 0
+                        needs_render = True
+                    elif seq in ("F", "4~"):  # End
+                        self._command_cursor = len(self._command_buffer)
+                        needs_render = True
+                    elif seq == "3~":  # Delete key (forward delete)
+                        if self._command_cursor < len(self._command_buffer):
+                            self._command_buffer = (
+                                self._command_buffer[:self._command_cursor]
+                                + self._command_buffer[self._command_cursor + 1:]
+                            )
+                            needs_render = True
+                    self._command_csi_buf = ""
+                    self._command_esc_mode = 0
+                continue
+            if self._command_esc_mode == 3:  # OSC: end with BEL or ST
+                if byte == 7:
+                    self._command_esc_mode = 0
+                elif byte == 27:
+                    self._command_esc_mode = 4
+                continue
+            if self._command_esc_mode == 4:  # OSC ST (ESC \)
+                self._command_esc_mode = 0
+                continue
+
+            # ── Normal bytes ──
+            if byte == 27:
+                self._command_esc_mode = 1
                 continue
             if byte in (10, 13):
+                if self._command_in_paste:
+                    self._command_buffer += "\n"
+                    self._command_cursor += 1
+                    continue
                 line = self._command_buffer.strip()
                 self._command_mode = False
                 self._command_buffer = ""
-                self._command_esc_mode = False
-                # Exit command mode without moving the cursor to a new line.
-                # Advancing locally (without child PTY output) can desync prompt rows.
+                self._command_cursor = 0
+                self._command_esc_mode = 0
+                self._command_in_paste = False
+                self._echo("\033[?25l")  # re-hide cursor for Claude TUI
                 self._echo("\r\033[2K")
                 if line:
                     self._handle_command(line)
+                    if self._proxy and self._proxy.child_pid:
+                        try:
+                            os.kill(self._proxy.child_pid, signal.SIGWINCH)
+                        except OSError:
+                            pass
                 return b""
             if byte == 3:  # Ctrl-C
                 self._command_mode = False
                 self._command_buffer = ""
-                self._command_esc_mode = False
-                self._echo("\r\033[2K^C")
+                self._command_cursor = 0
+                self._command_esc_mode = 0
+                self._command_in_paste = False
+                self._echo("\033[?25l\r\033[2K^C")
                 return b""
-            if byte in (8, 127):  # Backspace/Delete
-                if self._command_buffer:
-                    self._command_buffer = self._command_buffer[:-1]
-                    self._render_command_line_locked()
-                else:
+            if byte in (8, 127):  # Backspace
+                if self._command_cursor > 0:
+                    self._command_buffer = (
+                        self._command_buffer[:self._command_cursor - 1]
+                        + self._command_buffer[self._command_cursor:]
+                    )
+                    self._command_cursor -= 1
+                    needs_render = True
+                elif not self._command_buffer:
+                    # Empty buffer + backspace = exit command mode
                     self._command_mode = False
-                    self._command_esc_mode = False
-                    self._echo("\r\033[2K")
+                    self._command_esc_mode = 0
+                    self._command_in_paste = False
+                    self._echo("\033[?25l\r\033[2K")
+                    if self._proxy and self._proxy.child_pid:
+                        try:
+                            os.kill(self._proxy.child_pid, signal.SIGWINCH)
+                        except OSError:
+                            pass
                 continue
-            if byte == 27:  # ESC sequence (arrows, etc.) — swallow in command mode
-                self._command_esc_mode = True
+            if byte == 1:  # Ctrl-A (Home)
+                self._command_cursor = 0
+                needs_render = True
+                continue
+            if byte == 5:  # Ctrl-E (End)
+                self._command_cursor = len(self._command_buffer)
+                needs_render = True
+                continue
+            if byte == 21:  # Ctrl-U (clear line)
+                self._command_buffer = ""
+                self._command_cursor = 0
+                needs_render = True
+                continue
+            if byte == 11:  # Ctrl-K (kill to end)
+                self._command_buffer = self._command_buffer[:self._command_cursor]
+                needs_render = True
                 continue
             ch = chr(byte)
             if ch.isprintable():
-                self._command_buffer += ch
-                self._render_command_line_locked()
+                self._command_buffer = (
+                    self._command_buffer[:self._command_cursor]
+                    + ch
+                    + self._command_buffer[self._command_cursor:]
+                )
+                self._command_cursor += 1
+                if not self._command_in_paste:
+                    needs_render = True
+        if needs_render and self._command_mode:
+            self._render_command_line_locked()
         return b""
 
     def _render_command_line_locked(self) -> None:
         if not self._command_mode:
             return
-        # Keep command editing readable even while agent output is streaming.
+        display = self._command_buffer.replace("\n", " ↵ ")
+        prefix = "[procy-cmd] "
+        # Simple single-line render: clear line, write, position cursor
         self._echo(
-            "\r\033[2K\033[35m[procy-cmd]\033[0m "
-            + self._command_buffer
-            + "\033[0m"
+            "\r\033[2K\033[?25h\033[35m" + prefix[:len(prefix)-1]
+            + "\033[0m " + display + "\033[0m"
         )
+        chars_after = len(display) - self._command_cursor
+        if chars_after > 0:
+            self._echo(f"\033[{chars_after}D")
 
     def _on_output(self, data: bytes):
         now = time.time()
         with self._state_lock:
-            self._last_agent_output_at = now
             self._output_seq += 1
             if self.session_id and data:
                 try:
@@ -600,9 +716,11 @@ class Procy:
                 return
             clean_text = _clean_for_db(text)
             if not clean_text:
-                if self._command_mode:
-                    self._render_command_line_locked()
                 return
+            # Only count meaningful (non-noise) output for quiet detection.
+            # Spinner/status animations must not reset the timer, otherwise
+            # _wait_for_agent_response_done never sees "quiet" and hangs.
+            self._last_agent_output_at = now
             # Capture response text during evolve iterations
             if self._evolving and self._evolve_state == "waiting_response":
                 self._evolve_response_buf += clean_text
@@ -620,8 +738,6 @@ class Procy:
                 or "\n" in clean_text
             ):
                 self._flush_agent_log_locked(force=False)
-            if self._command_mode:
-                self._render_command_line_locked()
 
     def _on_resize(self, cols: int, rows: int):
         if not self.session_id:
@@ -720,7 +836,11 @@ class Procy:
             self._flush_pending_action_locked()
 
     def _handle_command(self, line: str):
-        parts = line.split()
+        try:
+            parts = shlex.split(line)
+        except ValueError as exc:
+            _err(f"invalid command syntax: {exc}")
+            return
         if not parts:
             return
         cmd = parts[0].lower()
@@ -767,6 +887,8 @@ class Procy:
                 _info("evolve thread is alive; requested stop. Run !status.")
             else:
                 _info("evolve state reset")
+        elif cmd == "!eval":
+            self._handle_eval_command(parts[1:])
         else:
             _err(f"unknown command: {cmd}. Type !help")
 
@@ -780,6 +902,11 @@ class Procy:
         _dim("!train       — export SFT training pairs as JSONL")
         _dim("!stop        — stop ongoing evolve")
         _dim("!reset-evolve— clear stuck evolve state")
+        _dim("!eval set <path>         — set evaluator script for this session")
+        _dim("!eval generate [desc]    — ask agent to write ./eval.py, then auto-register")
+        _dim("!eval show               — show current evaluator")
+        _dim("!eval run                — run evaluator manually")
+        _dim("!eval metrics            — show eval results history")
         _dim("!help        — this message")
 
     def _show_status(self):
@@ -810,6 +937,484 @@ class Procy:
             for c in corrections:
                 _dim(f"  original: {c['original_prompt'][:80]}")
                 _dim(f"  corrected: {c['corrected_prompt'][:80]}")
+
+    def _handle_eval_command(self, args: list[str]):
+        if not self.session_id:
+            _err("no active session")
+            return
+        if not args:
+            _info("usage: !eval set <path> | !eval generate [desc] | !eval show | !eval run | !eval metrics")
+            return
+        sub = args[0].lower()
+
+        if sub == "set":
+            if len(args) < 2:
+                _err("usage: !eval set <script_path> [--name <name>]")
+                return
+            rest = args[1:]
+            name = "default"
+            name_idx = None
+            for i, tok in enumerate(rest):
+                if tok == "--name":
+                    name_idx = i
+                    break
+                if tok.startswith("--name="):
+                    name = tok.split("=", 1)[1] or "default"
+                    name_idx = i
+                    break
+            if name_idx is None:
+                path_tokens = rest
+            else:
+                path_tokens = rest[:name_idx]
+                if rest[name_idx] == "--name":
+                    if name_idx + 1 >= len(rest):
+                        _err("usage: !eval set <script_path> [--name <name>]")
+                        return
+                    name = rest[name_idx + 1]
+            script_path = " ".join(path_tokens).strip()
+            if not script_path:
+                _err("usage: !eval set <script_path> [--name <name>]")
+                return
+            p = Path(script_path)
+            if not p.is_absolute():
+                p = Path(self.cwd) / p
+            if not p.exists():
+                _err(f"file not found: {p}")
+                return
+            suffix = p.suffix.lower()
+            if suffix == ".py":
+                run_cmd = f"python3 {{script}}"
+            elif suffix == ".sh":
+                run_cmd = f"bash {{script}}"
+            elif suffix == ".js":
+                run_cmd = f"node {{script}}"
+            else:
+                run_cmd = f"{{script}}"
+            content = p.read_text()
+            metrics_schema = self._detect_metrics_schema(content)
+            eid = self.store.set_evaluator(
+                self.session_id, name,
+                script_path=str(p),
+                script_content=content,
+                run_command=run_cmd,
+                metrics_schema=metrics_schema,
+                created_by="human",
+            )
+            _info(f"evaluator '{name}' set: {p.name}")
+            if metrics_schema:
+                metric_names = [m["name"] for m in metrics_schema]
+                _dim(f"detected metrics: {', '.join(metric_names)}")
+            _dim(f"run command: {run_cmd}")
+            _dim(f"evaluator id: {eid}")
+
+        elif sub == "generate":
+            desc = " ".join(args[1:]) if len(args) > 1 else ""
+            task_context = self.last_human_prompt or "the current task"
+            eval_desc = desc if desc else f"the task: {task_context[:200]}"
+            eval_path = (Path(self.cwd) / "eval.py").resolve()
+            prompt = (
+                f"Create or overwrite exactly this file: {eval_path}\n\n"
+                f"Write a Python evaluator script for {eval_desc}.\n\n"
+                "Requirements:\n"
+                "- It should print exactly one JSON line to stdout with numeric metrics.\n"
+                "- Example: print(json.dumps({\"accuracy\": 0.95, \"latency_ms\": 42.1}))\n"
+                "- Exit code 0 on success.\n"
+                "- It runs from the current project root.\n"
+                "- Keep it self-contained.\n\n"
+                "Important:\n"
+                "- Use the file-writing tool to save it directly to that path.\n"
+                "- Do not ask me to copy/paste code.\n"
+                "- Do NOT print the script source in chat.\n"
+                "- After writing, briefly summarize what it evaluates (2-4 bullets).\n"
+                "- Explicitly state the full path of the file you wrote.\n"
+                "- End with: 'WROTE eval.py'."
+            )
+            self._inject_prompt(prompt)
+            self._start_eval_autoset(eval_path, name="default", timeout_s=240)
+            _info(f"generation request sent; waiting for {eval_path.name} to appear...")
+            _dim("once written, procy auto-registers it. Use !eval show to confirm.")
+
+        elif sub == "show":
+            ev = self.store.get_evaluator(self.session_id)
+            if not ev:
+                _info("no evaluator set. Use: !eval set <path>")
+                return
+            _info(f"evaluator: {ev['name']}")
+            _dim(f"script: {ev.get('script_path', 'inline')}")
+            _dim(f"run: {ev.get('run_command', '?')}")
+            _dim(f"created by: {ev.get('created_by', '?')}")
+            schema = ev.get("metrics_schema")
+            if schema:
+                for m in schema:
+                    _dim(f"  metric: {m['name']} ({m.get('type','?')}, goal={m.get('goal','?')})")
+
+        elif sub == "run":
+            ev = self.store.get_evaluator(self.session_id)
+            if not ev:
+                _err("no evaluator set. Use: !eval set <path>")
+                return
+            _info(f"running evaluator '{ev['name']}'...")
+            result = self._run_evaluator(ev)
+            if result["exit_code"] == 0:
+                _info(f"eval complete: {json.dumps(result['metrics'], indent=2)}")
+            else:
+                _err(f"eval failed (exit {result['exit_code']})")
+                if result.get("raw_output"):
+                    _dim(result["raw_output"][:500])
+
+        elif sub == "metrics":
+            results = self.store.get_eval_results(self.session_id)
+            if not results:
+                _info("no eval results yet")
+                return
+            _info(f"eval results ({len(results)}):")
+            for r in results:
+                tag = f"#{r.get('iteration', '?')}" if r.get('iteration') else "manual"
+                metrics = r.get("metrics", {})
+                metric_str = ", ".join(f"{k}={v}" for k, v in metrics.items()) if isinstance(metrics, dict) else str(metrics)
+                _dim(f"  [{tag}] {metric_str} (exit={r.get('exit_code', '?')}, {r.get('duration_s', 0):.1f}s)")
+                trace = r.get("trace_metrics")
+                if trace:
+                    _dim(f"         trace: {json.dumps(trace)}")
+
+        else:
+            _err(f"unknown: !eval {sub}. Try: set, generate, show, run, metrics")
+
+    def _start_eval_autoset(self, eval_path: Path, name: str = "default", timeout_s: float = 240.0) -> None:
+        """Watch for eval_path creation/update and auto-register evaluator."""
+        with self._state_lock:
+            self._eval_autoset_generation += 1
+            gen = self._eval_autoset_generation
+        t = threading.Thread(
+            target=self._watch_eval_file_and_set,
+            args=(gen, eval_path, name, timeout_s),
+            daemon=True,
+            name="procy-eval-autoset",
+        )
+        t.start()
+
+    def _watch_eval_file_and_set(self, generation: int, eval_path: Path, name: str, timeout_s: float) -> None:
+        start = time.time()
+        initial_mtime = None
+        if eval_path.exists():
+            try:
+                initial_mtime = eval_path.stat().st_mtime
+            except OSError:
+                initial_mtime = None
+        while (time.time() - start) < timeout_s:
+            with self._state_lock:
+                if generation != self._eval_autoset_generation:
+                    return  # superseded by newer !eval generate
+            if eval_path.exists() and eval_path.is_file():
+                try:
+                    st = eval_path.stat()
+                    mtime = st.st_mtime
+                    size = st.st_size
+                except OSError:
+                    mtime = None
+                    size = 0
+                changed = (initial_mtime is None) or (mtime is not None and mtime != initial_mtime)
+                if size > 0 and changed:
+                    try:
+                        content = eval_path.read_text()
+                    except Exception as exc:
+                        _err(f"failed reading evaluator file: {exc}")
+                        return
+                    run_cmd = "python3 {script}" if eval_path.suffix.lower() == ".py" else "{script}"
+                    metrics_schema = self._detect_metrics_schema(content)
+                    eid = self.store.set_evaluator(
+                        self.session_id,
+                        name,
+                        script_path=str(eval_path),
+                        script_content=content,
+                        run_command=run_cmd,
+                        metrics_schema=metrics_schema,
+                        created_by="claude",
+                    )
+                    _info(f"evaluator auto-set: {eval_path.name} (id={eid})")
+                    if metrics_schema:
+                        _dim("metrics: " + ", ".join(m["name"] for m in metrics_schema))
+                    return
+            time.sleep(0.5)
+        _dim(f"auto-set timeout: {eval_path.name} not created/updated yet")
+
+    def _eval_generate(self, description: str):
+        """Ask Claude to write an evaluator script, capture it, and auto-register."""
+        try:
+            self._eval_generate_inner(description)
+        except Exception as exc:
+            import traceback
+            _err(f"eval generate crashed: {exc}")
+            _dim(traceback.format_exc()[:500])
+            with self._state_lock:
+                self._evolving = False
+                self._evolve_state = "idle"
+                self._evolve_response_buf = ""
+
+    def _eval_generate_inner(self, description: str):
+        if not self._proxy or not self._proxy.master_fd:
+            _err("no agent running")
+            return
+        task_context = self.last_human_prompt or "the current task"
+        if description:
+            eval_desc = description
+        else:
+            eval_desc = f"the task: {task_context[:200]}"
+        prompt = (
+            f"Write a Python evaluator script for {eval_desc}.\n\n"
+            "Requirements:\n"
+            "- The script should evaluate the quality/correctness of the work done\n"
+            "- It must print a single JSON line to stdout with numeric metrics\n"
+            "  e.g. print(json.dumps({\"accuracy\": 0.95, \"latency_ms\": 42.1}))\n"
+            "- The first metric in the JSON is the primary score\n"
+            "- Exit code 0 = success, non-zero = failure\n"
+            "- The script runs from the project root directory\n"
+            "- Available env vars: $PROCY_SESSION, $PROCY_ITERATION, $PROCY_CWD\n"
+            "- Keep it self-contained (no procy imports needed)\n\n"
+            "Output ONLY the Python script in a single ```python code block, nothing else."
+        )
+        _info("asking Claude to generate evaluator...")
+        _dim(f"context: {eval_desc[:100]}")
+        with self._state_lock:
+            self._evolve_response_buf = ""
+            old_state = self._evolve_state
+            old_evolving = self._evolving
+            self._stop_evolve = False  # reset in case left over from previous run
+            self._evolving = True
+            self._evolve_state = "waiting_response"
+        before_seq = self._output_seq
+        self._inject_prompt(prompt)
+        _dim(f"waiting for Claude to respond... (before_seq={before_seq}, stop_evolve={self._stop_evolve})")
+        if not self._wait_for_agent_response_done(before_seq, timeout=120):
+            with self._state_lock:
+                buf_len = len(self._evolve_response_buf)
+                cur_seq = self._output_seq
+                stop = self._stop_evolve
+                self._evolving = old_evolving
+                self._evolve_state = old_state
+                self._evolve_response_buf = ""
+            _err(f"timeout waiting for Claude's response (seq={cur_seq}, buf={buf_len}, stop={stop})")
+            return
+        with self._state_lock:
+            buf_len = len(self._evolve_response_buf)
+        _dim(f"response captured ({buf_len} chars), extracting code...")
+        with self._state_lock:
+            response_text = _clean_for_db(self._evolve_response_buf)
+            self._evolve_response_buf = ""
+            self._evolving = old_evolving
+            self._evolve_state = old_state
+        if not response_text:
+            _err("empty response from Claude")
+            _dim(f"raw buf len was: {len(self._evolve_response_buf)}")
+            return
+        script_content = self._extract_code_block(response_text, "python")
+        if not script_content:
+            _err("no ```python code block found in response")
+            _dim(f"response preview: {response_text[:300]}")
+            return
+        eval_name = "eval_generated"
+        if description:
+            slug = re.sub(r'[^a-z0-9]+', '_', description.lower().strip())[:30].strip('_')
+            if slug:
+                eval_name = f"eval_{slug}"
+        eval_path = Path(self.cwd) / f"{eval_name}.py"
+        counter = 1
+        while eval_path.exists():
+            eval_path = Path(self.cwd) / f"{eval_name}_{counter}.py"
+            counter += 1
+        eval_path.write_text(script_content)
+        _info(f"saved evaluator: {eval_path.name}")
+        metrics_schema = self._detect_metrics_schema(script_content)
+        run_cmd = f"python3 {{script}}"
+        eid = self.store.set_evaluator(
+            self.session_id, "default",
+            script_path=str(eval_path),
+            script_content=script_content,
+            run_command=run_cmd,
+            metrics_schema=metrics_schema,
+            created_by="claude",
+        )
+        _info(f"evaluator registered (id={eid})")
+        if metrics_schema:
+            metric_names = [m["name"] for m in metrics_schema]
+            _dim(f"detected metrics: {', '.join(metric_names)}")
+        _dim("run !eval run to test it, or !evolve N to start optimizing")
+
+    def _extract_code_block(self, text: str, lang: str = "python") -> str | None:
+        """Extract content of a fenced code block from text.
+
+        Robust to language tags like ```py, ```python3, or no tag.
+        """
+        blocks: list[tuple[int, str]] = []
+        for m in re.finditer(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL):
+            raw_tag = (m.group(1) or "").strip().lower()
+            code = (m.group(2) or "").strip()
+            if not code:
+                continue
+            score = 0
+            if raw_tag:
+                if raw_tag == lang or raw_tag.startswith(lang):
+                    score += 6
+                elif raw_tag in ("py", "python3", "py3"):
+                    score += 5
+                else:
+                    score -= 1
+            # Prefer blocks that look like Python source.
+            if re.search(r"^\s*(import\s+\w+|from\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+|if __name__\s*==)", code, re.MULTILINE):
+                score += 4
+            if "json.dumps" in code:
+                score += 2
+            score += min(len(code), 6000) // 1200
+            blocks.append((score, code))
+        if blocks:
+            blocks.sort(key=lambda x: x[0], reverse=True)
+            return blocks[0][1]
+
+        # Fallback: if model forgot fences, try to recover raw Python-ish text.
+        raw = text.strip()
+        if re.search(r"^\s*(import\s+\w+|from\s+\w+\s+import|def\s+\w+\s*\(|class\s+\w+|if __name__\s*==)", raw, re.MULTILINE):
+            lines = []
+            for ln in raw.splitlines():
+                s = ln.strip()
+                if re.match(r"^(here(?:'s| is)?|sure[,!:]?|below is|this script)", s, re.IGNORECASE):
+                    continue
+                if s.startswith("```"):
+                    continue
+                lines.append(ln)
+            candidate = "\n".join(lines).strip()
+            return candidate or None
+        return None
+
+    def _detect_metrics_schema(self, script_content: str) -> list[dict]:
+        """Try to detect metric names from evaluator script output JSON keys."""
+        import re
+        keys_found = set()
+        for m in re.finditer(r'json\.dumps\s*\(\s*\{([^}]+)\}', script_content):
+            block = m.group(1)
+            for km in re.finditer(r'["\'](\w+)["\']\s*:', block):
+                keys_found.add(km.group(1))
+        for m in re.finditer(r'(?:results?|metrics?|output)\s*=\s*\{([^}]+)\}', script_content):
+            block = m.group(1)
+            for km in re.finditer(r'["\'](\w+)["\']\s*:', block):
+                keys_found.add(km.group(1))
+        skip = {"type", "name", "error", "status", "message", "version",
+                "model", "data", "input", "output", "content", "role",
+                "__main__", "format", "help", "default", "action",
+                "dim", "shape", "size", "length", "count", "index",
+                "n_base", "n_query", "n_train", "n_test", "k"}
+        keys_found -= skip
+        schema = []
+        for key in sorted(keys_found):
+            goal = "maximize"
+            if any(w in key.lower() for w in ("time", "latency", "error", "loss",
+                                                "cost", "memory", "mem", "size")):
+                goal = "minimize"
+            schema.append({"name": key, "type": "float", "goal": goal})
+        return schema[:10]
+
+    def _run_evaluator(self, evaluator: dict, evolve_run_id: int | None = None,
+                        iteration: int | None = None) -> dict:
+        """Run an evaluator script and parse its JSON output."""
+        import subprocess as sp
+        script_path = evaluator.get("script_path")
+        run_cmd = evaluator.get("run_command", "python3 {script}")
+        if not script_path or not Path(script_path).exists():
+            content = evaluator.get("script_content")
+            if not content:
+                return {"metrics": {}, "raw_output": "no script", "exit_code": -1, "duration_s": 0}
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+                f.write(content)
+                script_path = f.name
+        script_path_str = str(script_path)
+        # Default placeholder expansion uses shell-safe quoting so paths with
+        # spaces work (e.g. "/Users/.../New project/eval_generated.py").
+        script_quoted = shlex.quote(script_path_str)
+        if "{script_quoted}" in run_cmd:
+            cmd = run_cmd.replace("{script_quoted}", script_quoted).replace("{script}", script_path_str)
+        else:
+            cmd = run_cmd.replace("{script}", script_quoted)
+        env = os.environ.copy()
+        env["PROCY_SESSION"] = self.session_id or ""
+        env["PROCY_CWD"] = self.cwd or ""
+        env["PROCY_DB"] = str(self.store.db_path) if self.store else ""
+        if iteration is not None:
+            env["PROCY_ITERATION"] = str(iteration)
+        if evolve_run_id is not None:
+            env["PROCY_EVOLVE_RUN_ID"] = str(evolve_run_id)
+        changed = self._get_changed_files()
+        if changed:
+            env["PROCY_FILES_CHANGED"] = "\n".join(changed)
+        start = time.time()
+        try:
+            result = sp.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=300, cwd=self.cwd, env=env,
+            )
+            duration = time.time() - start
+            raw_output = result.stdout.strip()
+            metrics = {}
+            lines = raw_output.split("\n")
+            for line in reversed(lines):
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        metrics = json.loads(line)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            trace_metrics = self._compute_trace_metrics()
+            self.store.log_eval_result(
+                self.session_id, evaluator["id"],
+                metrics=metrics, raw_output=raw_output[:8000],
+                exit_code=result.returncode, duration_s=duration,
+                trace_metrics=trace_metrics,
+                evolve_run_id=evolve_run_id, iteration=iteration,
+            )
+            if evolve_run_id and metrics:
+                schema = evaluator.get("metrics_schema", [])
+                primary = schema[0]["name"] if schema else next(iter(metrics), None)
+                if primary and primary in metrics:
+                    score = float(metrics[primary])
+                    self.store.update_evolve_score(evolve_run_id, json.dumps(metrics), score)
+            return {
+                "metrics": metrics,
+                "trace_metrics": trace_metrics,
+                "raw_output": raw_output,
+                "exit_code": result.returncode,
+                "duration_s": duration,
+            }
+        except sp.TimeoutExpired:
+            return {"metrics": {}, "raw_output": "timeout", "exit_code": -1, "duration_s": 300}
+        except Exception as e:
+            return {"metrics": {}, "raw_output": str(e), "exit_code": -1, "duration_s": 0}
+
+    def _get_changed_files(self) -> list[str]:
+        """Return deduplicated list of files Claude wrote/edited this session."""
+        if not self.session_id:
+            return []
+        actions = self.store.get_actions(self.session_id) if hasattr(self.store, "get_actions") else []
+        seen = set()
+        files = []
+        for a in actions:
+            if a.get("tool_name") in ("write", "edit"):
+                path = (a.get("tool_input") or "").strip()
+                if path and path not in seen:
+                    seen.add(path)
+                    files.append(path)
+        return files
+
+    def _compute_trace_metrics(self) -> dict:
+        """Compute metrics from procy's own traces (tool calls, turn count, etc.)."""
+        if not self.session_id:
+            return {}
+        turns = self.store.get_turns(self.session_id) or []
+        actions = self.store.get_actions(self.session_id) if hasattr(self.store, "get_actions") else []
+        return {
+            "total_turns": len(turns),
+            "total_tool_calls": len(actions),
+            "tool_names": list(set(a.get("tool_name", "") for a in actions)) if actions else [],
+        }
 
     def _do_correct(self):
         if not self.last_human_prompt:
@@ -861,7 +1466,6 @@ class Procy:
         with self._state_lock:
             last_prompt = self.last_human_prompt
             already_running = self._evolving
-            prompt_visible = self._is_agent_prompt_visible()
             quiet_for = time.time() - self._last_agent_output_at
             has_output = self._output_seq > 0
             if already_running and self._evolve_thread and not self._evolve_thread.is_alive():
@@ -872,8 +1476,10 @@ class Procy:
             cur, total = self._evolve_progress
             _err(f"evolve already running ({cur}/{total}, state={self._evolve_state}). Use !stop.")
             return
-        if has_output and (not prompt_visible or quiet_for < 0.25):
-            _err("wait for the agent prompt to be idle, then run !evolve again")
+        # Be permissive: prompt glyph detection can fail on some terminal themes.
+        # Only block when output is still actively streaming.
+        if has_output and quiet_for < 0.25:
+            _err("agent is still outputting; wait a moment, then run !evolve again")
             return
         if not last_prompt or not last_prompt.strip():
             _err("no previous prompt to evolve from")
@@ -962,12 +1568,31 @@ class Procy:
                 response_summary = response_text[:4000] if response_text else ""
                 self.store.update_evolve_response(evolve_id, response_summary)
 
-                evolve_history.append({"iteration": i, "prompt": new_prompt, "response_summary": response_summary, "score": None, "source": "procy"})
+                # Run evaluator if one is set
+                score = None
+                evaluator = self.store.get_evaluator(self.session_id)
+                if evaluator:
+                    with self._state_lock:
+                        self._evolve_state = "evaluating"
+                        self._evolve_note = f"[#{i}] running evaluator..."
+                    eval_result = self._run_evaluator(evaluator, evolve_run_id=evolve_id, iteration=i)
+                    if eval_result["exit_code"] == 0 and eval_result["metrics"]:
+                        schema = evaluator.get("metrics_schema", [])
+                        primary = schema[0]["name"] if schema else next(iter(eval_result["metrics"]), None)
+                        if primary and primary in eval_result["metrics"]:
+                            score = float(eval_result["metrics"][primary])
+                        with self._state_lock:
+                            self._evolve_note = f"[#{i}] eval: {json.dumps(eval_result['metrics'])}"
+                    else:
+                        with self._state_lock:
+                            self._evolve_note = f"[#{i}] eval failed (exit {eval_result['exit_code']})"
+
+                evolve_history.append({"iteration": i, "prompt": new_prompt, "response_summary": response_summary, "score": score, "source": "procy"})
                 completed = i
                 with self._state_lock:
                     self._evolve_progress = (completed, n)
                     self._evolve_state = "running"
-                    self._evolve_note = f"[#{i}/{n}] complete"
+                    self._evolve_note = f"[#{i}/{n}] complete" + (f" score={score:.4f}" if score is not None else "")
                 time.sleep(0.2)
         except Exception as exc:
             with self._state_lock:
