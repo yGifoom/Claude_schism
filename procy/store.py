@@ -127,6 +127,44 @@ class TraceStore:
                     ON evolve_runs(session_id, iteration);
                 CREATE INDEX IF NOT EXISTS idx_terminal_events_session_id
                     ON terminal_events(session_id, id);
+
+                -- Population tables for OpenEvolve-style evolution
+                CREATE TABLE IF NOT EXISTS programs (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    commit_hash TEXT,
+                    parent_id TEXT,
+                    generation INTEGER DEFAULT 0,
+                    island_id INTEGER DEFAULT 0,
+                    iteration INTEGER,
+                    metrics TEXT,
+                    feature_coords TEXT,
+                    fitness_score REAL DEFAULT 0,
+                    changes_description TEXT,
+                    metadata TEXT,
+                    timestamp REAL NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_programs_session_island
+                    ON programs(session_id, island_id, fitness_score DESC);
+                CREATE INDEX IF NOT EXISTS idx_programs_session_fitness
+                    ON programs(session_id, fitness_score DESC);
+
+                CREATE TABLE IF NOT EXISTS island_config (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL UNIQUE,
+                    num_islands INTEGER DEFAULT 5,
+                    feature_dimensions TEXT DEFAULT '["complexity", "diversity"]',
+                    feature_bins INTEGER DEFAULT 10,
+                    population_size INTEGER DEFAULT 1000,
+                    migration_interval INTEGER DEFAULT 50,
+                    migration_rate REAL DEFAULT 0.1,
+                    archive_size INTEGER DEFAULT 100,
+                    exploration_ratio REAL DEFAULT 0.2,
+                    exploitation_ratio REAL DEFAULT 0.7,
+                    timestamp REAL NOT NULL,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                );
             """)
 
     def _session_exists(self, c: sqlite3.Connection, session_id: str) -> bool:
@@ -660,6 +698,194 @@ class TraceStore:
                             pass
                 results.append(d)
             return results
+
+    # ── Population (OpenEvolve-style) ──
+
+    def add_program(
+        self, session_id: str, *,
+        commit_hash: str | None = None,
+        parent_id: str | None = None,
+        generation: int = 0,
+        island_id: int = 0,
+        iteration: int | None = None,
+        metrics: dict | None = None,
+        feature_coords: list[int] | None = None,
+        fitness_score: float = 0,
+        changes_description: str | None = None,
+        metadata: dict | None = None,
+    ) -> str:
+        pid = str(uuid.uuid4())
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO programs
+                   (id, session_id, commit_hash, parent_id, generation,
+                    island_id, iteration, metrics, feature_coords,
+                    fitness_score, changes_description, metadata, timestamp)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (pid, session_id, commit_hash, parent_id, generation,
+                 island_id, iteration,
+                 json.dumps(metrics) if metrics else None,
+                 json.dumps(feature_coords) if feature_coords else None,
+                 fitness_score, changes_description,
+                 json.dumps(metadata) if metadata else None,
+                 time.time()),
+            )
+        return pid
+
+    def get_program(self, program_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM programs WHERE id=?", (program_id,)).fetchone()
+            return self._parse_program(row) if row else None
+
+    def _parse_program(self, row) -> dict:
+        d = dict(row)
+        for key in ("metrics", "feature_coords", "artifacts", "metadata"):
+            if d.get(key):
+                try:
+                    d[key] = json.loads(d[key])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return d
+
+    def get_top_programs(self, session_id: str, n: int, island_id: int | None = None) -> list[dict]:
+        with self._conn() as c:
+            if island_id is not None:
+                rows = c.execute(
+                    "SELECT * FROM programs WHERE session_id=? AND island_id=? ORDER BY fitness_score DESC LIMIT ?",
+                    (session_id, island_id, n),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM programs WHERE session_id=? ORDER BY fitness_score DESC LIMIT ?",
+                    (session_id, n),
+                ).fetchall()
+            return [self._parse_program(r) for r in rows]
+
+    def get_diverse_programs(self, session_id: str, n: int, exclude_ids: list[str] | None = None) -> list[dict]:
+        with self._conn() as c:
+            if exclude_ids:
+                placeholders = ",".join("?" for _ in exclude_ids)
+                rows = c.execute(
+                    f"SELECT * FROM programs WHERE session_id=? AND id NOT IN ({placeholders}) ORDER BY RANDOM() LIMIT ?",
+                    (session_id, *exclude_ids, n),
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM programs WHERE session_id=? ORDER BY RANDOM() LIMIT ?",
+                    (session_id, n),
+                ).fetchall()
+            return [self._parse_program(r) for r in rows]
+
+    def get_island_programs(self, session_id: str, island_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM programs WHERE session_id=? AND island_id=? ORDER BY fitness_score DESC",
+                (session_id, island_id),
+            ).fetchall()
+            return [self._parse_program(r) for r in rows]
+
+    def count_programs(self, session_id: str, island_id: int | None = None) -> int:
+        with self._conn() as c:
+            if island_id is not None:
+                row = c.execute(
+                    "SELECT COUNT(*) AS cnt FROM programs WHERE session_id=? AND island_id=?",
+                    (session_id, island_id),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS cnt FROM programs WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+            return row["cnt"]
+
+    def get_best_program(self, session_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM programs WHERE session_id=? ORDER BY fitness_score DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            return self._parse_program(row) if row else None
+
+    def update_program_metrics(
+        self, program_id: str, metrics: dict,
+        fitness_score: float, feature_coords: list[int] | None = None,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE programs SET metrics=?, fitness_score=?, feature_coords=? WHERE id=?",
+                (json.dumps(metrics), fitness_score,
+                 json.dumps(feature_coords) if feature_coords else None,
+                 program_id),
+            )
+
+    def get_island_config(self, session_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM island_config WHERE session_id=?", (session_id,),
+            ).fetchone()
+            if row:
+                d = dict(row)
+                if d.get("feature_dimensions"):
+                    try:
+                        d["feature_dimensions"] = json.loads(d["feature_dimensions"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                return d
+            return None
+
+    def set_island_config(self, session_id: str, **kwargs) -> int:
+        with self._conn() as c:
+            existing = c.execute(
+                "SELECT id FROM island_config WHERE session_id=?", (session_id,),
+            ).fetchone()
+            if existing:
+                sets = []
+                vals = []
+                for k, v in kwargs.items():
+                    if k == "feature_dimensions" and isinstance(v, list):
+                        v = json.dumps(v)
+                    sets.append(f"{k}=?")
+                    vals.append(v)
+                sets.append("timestamp=?")
+                vals.append(time.time())
+                vals.append(session_id)
+                c.execute(
+                    f"UPDATE island_config SET {', '.join(sets)} WHERE session_id=?",
+                    vals,
+                )
+                return existing["id"]
+            else:
+                fd = kwargs.get("feature_dimensions", ["complexity", "diversity"])
+                if isinstance(fd, list):
+                    fd = json.dumps(fd)
+                c.execute(
+                    """INSERT INTO island_config
+                       (session_id, num_islands, feature_dimensions, feature_bins,
+                        population_size, migration_interval, migration_rate,
+                        archive_size, exploration_ratio, exploitation_ratio, timestamp)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (session_id,
+                     kwargs.get("num_islands", 5),
+                     fd,
+                     kwargs.get("feature_bins", 10),
+                     kwargs.get("population_size", 1000),
+                     kwargs.get("migration_interval", 50),
+                     kwargs.get("migration_rate", 0.1),
+                     kwargs.get("archive_size", 100),
+                     kwargs.get("exploration_ratio", 0.2),
+                     kwargs.get("exploitation_ratio", 0.7),
+                     time.time()),
+                )
+                return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def get_recent_programs(self, session_id: str, n: int = 10) -> list[dict]:
+        """Get N most recent programs (for history display)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM programs WHERE session_id=? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, n),
+            ).fetchall()
+            return [self._parse_program(r) for r in rows]
 
     def get_eval_history_for_prompt(self, session_id: str) -> list[dict]:
         """Get eval results with evolve iteration info, for feeding to proxy model."""

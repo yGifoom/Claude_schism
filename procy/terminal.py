@@ -51,6 +51,16 @@ class ProxySession:
         self._env.pop("CLAUDECODE", None)
         self.child_pid: int | None = None
         self.master_fd: int | None = None
+        self.suppress_output: bool = False
+        # Injection pipe: other threads write here, proxy_loop forwards to master_fd
+        self._inject_r, self._inject_w = os.pipe()
+
+    def inject(self, data: bytes) -> None:
+        """Thread-safe: inject bytes into the child process via the proxy loop."""
+        try:
+            os.write(self._inject_w, data)
+        except OSError:
+            pass
 
     def run(self) -> int:
         """Run the proxy session. Blocks until the child exits. Returns exit code."""
@@ -125,7 +135,7 @@ class ProxySession:
             # Main I/O loop
             while True:
                 try:
-                    fds = [sys.stdin.fileno(), master_fd]
+                    fds = [sys.stdin.fileno(), master_fd, self._inject_r]
                     ready, _, _ = select.select(fds, [], [], 0.1)
                 except (select.error, ValueError):
                     break
@@ -151,6 +161,15 @@ class ProxySession:
                     except OSError:
                         break
 
+                if self._inject_r in ready:
+                    # Another thread injected data — forward to child
+                    try:
+                        data = os.read(self._inject_r, 4096)
+                        if data:
+                            os.write(master_fd, data)
+                    except OSError:
+                        pass
+
                 if master_fd in ready:
                     # Child produced output
                     try:
@@ -160,8 +179,9 @@ class ProxySession:
                     if not data:
                         break
 
-                    # Forward to user's terminal
-                    write_bytes(data)
+                    # Forward to user's terminal (unless suppressed during evolve)
+                    if not self.suppress_output:
+                        write_bytes(data)
 
                     # Let on_output observe after forwarding so observers can
                     # redraw overlays/prompts on top of freshly printed output.

@@ -33,6 +33,7 @@ procy --no-tunnel
 
 # Custom Qwen API URL (if proxy model is hosted elsewhere)
 procy --qwen-url http://localhost:18000
+
 ```
 
 ## ProCy Commands

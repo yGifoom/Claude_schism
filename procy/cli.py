@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import ast
 import json
 import os
 import shlex
@@ -19,6 +20,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import re
@@ -34,8 +36,15 @@ UI_PID_FILE = PROCY_HOME / "ui.pid"
 
 # SSH tunnel config
 QWEN_SSH_HOST = "EXP07"        # from ~/.ssh/config
-QWEN_REMOTE_PORT = 18000       # vllm Docker: -p 18000:8000
+QWEN_REMOTE_PORT = 8000        # vLLM instance 0 port
 QWEN_LOCAL_PORT = 18000        # local tunnel port (high to avoid conflicts)
+
+# GPU inference / training config
+QWEN_MODEL_ID = "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+QWEN_SERVED_NAME = "qwen35"
+QWEN_NUM_GPUS = 4
+QWEN_INFERENCE_PORTS = list(range(8000, 8000 + QWEN_NUM_GPUS))
+LORA_PATH = "/dev/shm/procy_lora"  # on EXP07, fast storage
 
 
 def ensure_home():
@@ -45,13 +54,13 @@ def ensure_home():
 # ── ANSI helpers ──
 
 def _info(msg: str):
-    write_stdout(f"\033[35m[procy]\033[0m {msg}\r\n")
+    write_stdout(f"\r\033[2K\033[35m[procy]\033[0m {msg}\r\n")
 
 def _dim(msg: str):
-    write_stdout(f"\033[2m  {msg}\033[0m\r\n")
+    write_stdout(f"\r\033[2K\033[2m  {msg}\033[0m\r\n")
 
 def _err(msg: str):
-    write_stdout(f"\033[31m[procy]\033[0m {msg}\r\n")
+    write_stdout(f"\r\033[2K\033[31m[procy]\033[0m {msg}\r\n")
 
 
 # ── SSH Tunnel ──
@@ -62,7 +71,7 @@ def _port_in_use(port: int) -> bool:
 
 
 def start_tunnel() -> subprocess.Popen | None:
-    """Start SSH tunnel: localhost:QWEN_LOCAL_PORT -> EXP07:8000."""
+    """Start SSH tunnel: localhost:QWEN_LOCAL_PORT -> EXP07:QWEN_REMOTE_PORT."""
     if _port_in_use(QWEN_LOCAL_PORT):
         _dim(f"tunnel already active on :{QWEN_LOCAL_PORT}")
         return None
@@ -107,6 +116,71 @@ def stop_tunnel(proc: subprocess.Popen | None):
         except subprocess.TimeoutExpired:
             proc.kill()
     TUNNEL_PID_FILE.unlink(missing_ok=True)
+
+
+# ── GPU inference management ──
+
+def _gpu_stop_inference(host: str):
+    """Stop all procy_gpu* inference containers on host."""
+    names = " ".join(f"procy_gpu{i}" for i in range(QWEN_NUM_GPUS))
+    subprocess.run(
+        ["ssh", host, f"docker stop {names} 2>/dev/null; docker rm {names} 2>/dev/null"],
+        capture_output=True, timeout=30,
+    )
+    # Wait for GPUs to free
+    time.sleep(3)
+
+
+def _gpu_start_inference(host: str, use_lora: bool = False):
+    """Start one vLLM inference container per GPU on host."""
+    for i in range(QWEN_NUM_GPUS):
+        port = QWEN_INFERENCE_PORTS[i]
+        name = f"procy_gpu{i}"
+
+        lora_flags = ""
+        lora_mount = ""
+        if use_lora:
+            lora_mount = f"-v {LORA_PATH}:/lora"
+            lora_flags = f"--enable-lora --lora-modules trained=/lora/latest"
+
+        cmd = (
+            f"docker run -d --name {name}"
+            f" --gpus '\"device={i}\"'"
+            f" --shm-size 4g"
+            f" -e VLLM_DISABLE_PYNCCL=1"
+            f" -e CUDA_VISIBLE_DEVICES=0"
+            f" -v /dev/shm/hf_cache:/root/.cache/huggingface"
+            f" {lora_mount}"
+            f" -p {port}:8000"
+            f" vllm/vllm-openai:latest"
+            f" --model {QWEN_MODEL_ID}"
+            f" --served-model-name {QWEN_SERVED_NAME}"
+            f" --tensor-parallel-size 1"
+            f" --gpu-memory-utilization 0.85"
+            f" --max-model-len 4096"
+            f" --max-num-seqs 2"
+            f" --max-num-batched-tokens 512"
+            f" --enforce-eager"
+            f" --skip-mm-profiling"
+            f" --limit-mm-per-prompt '{{\"image\":0,\"video\":0}}'"
+            f" --port 8000"
+            f" {lora_flags}"
+        )
+        subprocess.run(["ssh", host, cmd], capture_output=True, timeout=30)
+        _dim(f"  started {name} on GPU {i}, port {port}")
+
+    # Wait for servers to initialize
+    _dim("waiting for inference servers to start...")
+    time.sleep(90)
+    # Quick health check on first instance
+    result = subprocess.run(
+        ["ssh", host, f"curl -sf http://localhost:{QWEN_INFERENCE_PORTS[0]}/v1/models"],
+        capture_output=True, timeout=15,
+    )
+    if result.returncode == 0:
+        _dim("inference servers ready")
+    else:
+        _dim("warning: servers may still be starting up")
 
 
 # ── UI Server ──
@@ -310,12 +384,14 @@ class Procy:
         db_path: str = str(DEFAULT_DB),
         qwen_url: str | None = None,
         resume_procy: str | None = None,
+        evolve_policy: str = "fixed",
     ):
         self.agent_cmd = agent_cmd
         self.cwd = cwd or os.getcwd()
         self.store = TraceStore(db_path)
         self.qwen_url = qwen_url
         self.resume_procy = (resume_procy or "").strip() or None
+        self.evolve_policy = evolve_policy  # "fixed" or "proxy"
         self._resume_agent_session_id: str | None = None
 
         self.session_id: str | None = None
@@ -324,6 +400,7 @@ class Procy:
         self._command_mode = False
         self._command_buffer = ""
         self._command_cursor = 0  # cursor position within buffer
+        self._command_silent = False  # hide local command overlay while agent is actively streaming
         self._command_esc_mode = 0  # 0=none, 1=after ESC, 2=CSI, 3=OSC, 4=OSC_ESC
         self._command_csi_buf = ""
         self._command_in_paste = False
@@ -360,24 +437,61 @@ class Procy:
         """Echo text directly to the real terminal (bypasses PTY, works in raw mode)."""
         write_stdout(text)
 
+    def _refresh_agent_screen(self, *, force: bool = False) -> None:
+        """Ask the wrapped TUI to repaint after local procy overlays."""
+        if not force:
+            return
+        if not self._proxy or not self._proxy.child_pid:
+            return
+        try:
+            os.kill(self._proxy.child_pid, signal.SIGWINCH)
+        except OSError:
+            return
+        # Intentionally avoid injecting Ctrl+L redraws here; they can cause
+        # visible full-screen refresh flicker in the wrapped terminal UI.
+
     def _on_input(self, data: bytes) -> bytes | None:
         now = time.time()
         with self._state_lock:
             self._last_input_at = now
             if self._command_mode:
+                # Recovery path: if command mode was hidden (silent) and empty,
+                # don't swallow normal typing forever.
+                if (
+                    self._command_silent
+                    and not self._command_buffer
+                    and data
+                    and len(data) == 1
+                ):
+                    b0 = data[0]
+                    if 32 <= b0 <= 126 and b0 != ord("!"):
+                        self._command_mode = False
+                        self._command_silent = False
+                        self._command_cursor = 0
+                        self._command_esc_mode = 0
+                        self._command_csi_buf = ""
+                        self._command_in_paste = False
+                        # Pass through to agent as normal input.
+                        return None
                 return self._handle_command_mode_input(data)
             if (
                 not self._typed_line_buffer
                 and data
                 and data[0] == ord("!")
             ):
+                quiet_for = time.time() - self._last_agent_output_at
+                streaming = self._output_seq > 0 and quiet_for < 0.25
                 self._command_mode = True
                 self._command_buffer = ""
                 self._command_cursor = 0
+                # While evolve is running, keep command input visible so user can
+                # type and get an explicit "rejected while running" response.
+                self._command_silent = streaming and not self._evolving
                 self._command_esc_mode = 0
                 self._command_csi_buf = ""
                 self._command_in_paste = False
-                self._echo("\033[?25h")  # show cursor (Claude TUI hides it)
+                if not self._command_silent:
+                    self._echo("\033[?25h")  # show cursor (Claude TUI hides it)
                 return self._handle_command_mode_input(data)
             if self.session_id and data:
                 try:
@@ -477,6 +591,10 @@ class Procy:
         if not text:
             return ""
         first_line = text.split("\n", 1)[0].lstrip()
+        # Some terminal integrations prepend prompt markers like "|" or "P>|".
+        # Strip these before command detection so "!..." doesn't get logged as
+        # a normal human prompt.
+        first_line = re.sub(r"^(?:[|>›❯\\\[\]\s]|P>)+", "", first_line)
         if first_line.startswith("!"):
             return ""
         cleaned_lines: list[str] = []
@@ -487,6 +605,9 @@ class Procy:
                     cleaned_lines.append("")
                 continue
             low = s.lower()
+            # Drop pure prompt marker residue.
+            if re.match(r"^[|>›❯\\\[\]]+$", s):
+                continue
             if s.startswith(("P>|", "|Warp", "❯", "›")):
                 continue
             if "for shortcuts" in low or "for bash mode" in low:
@@ -537,6 +658,13 @@ class Procy:
         return text
 
     def _handle_command_mode_input(self, data: bytes) -> bytes:
+        if self._command_mode and self._command_silent:
+            # Output is still moving; avoid local redraw flicker.
+            quiet_for = time.time() - self._last_agent_output_at
+            if self._output_seq == 0 or quiet_for >= 0.35:
+                self._command_silent = False
+                self._echo("\033[?25h")
+                self._render_command_line_locked()
         needs_render = False
         for byte in data:
             # ── Escape sequence state machine ──
@@ -614,15 +742,12 @@ class Procy:
                 self._command_cursor = 0
                 self._command_esc_mode = 0
                 self._command_in_paste = False
-                self._echo("\033[?25l")  # re-hide cursor for Claude TUI
-                self._echo("\r\033[2K")
+                was_silent = self._command_silent
+                self._command_silent = False
+                if not was_silent:
+                    self._echo("\033[?25l\r\033[2K")
                 if line:
                     self._handle_command(line)
-                    if self._proxy and self._proxy.child_pid:
-                        try:
-                            os.kill(self._proxy.child_pid, signal.SIGWINCH)
-                        except OSError:
-                            pass
                 return b""
             if byte == 3:  # Ctrl-C
                 self._command_mode = False
@@ -630,7 +755,9 @@ class Procy:
                 self._command_cursor = 0
                 self._command_esc_mode = 0
                 self._command_in_paste = False
-                self._echo("\033[?25l\r\033[2K^C")
+                if not self._command_silent:
+                    self._echo("\033[?25l\r\033[2K^C")
+                self._command_silent = False
                 return b""
             if byte in (8, 127):  # Backspace
                 if self._command_cursor > 0:
@@ -645,12 +772,10 @@ class Procy:
                     self._command_mode = False
                     self._command_esc_mode = 0
                     self._command_in_paste = False
-                    self._echo("\033[?25l\r\033[2K")
-                    if self._proxy and self._proxy.child_pid:
-                        try:
-                            os.kill(self._proxy.child_pid, signal.SIGWINCH)
-                        except OSError:
-                            pass
+                    if not self._command_silent:
+                        self._echo("\033[?25l\r\033[2K")
+                    self._command_silent = False
+                    time.sleep(0.05)
                 continue
             if byte == 1:  # Ctrl-A (Home)
                 self._command_cursor = 0
@@ -684,22 +809,53 @@ class Procy:
         return b""
 
     def _render_command_line_locked(self) -> None:
-        if not self._command_mode:
+        if not self._command_mode or self._command_silent:
             return
-        display = self._command_buffer.replace("\n", " ↵ ")
-        prefix = "[procy-cmd] "
-        # Simple single-line render: clear line, write, position cursor
-        self._echo(
-            "\r\033[2K\033[?25h\033[35m" + prefix[:len(prefix)-1]
-            + "\033[0m " + display + "\033[0m"
-        )
-        chars_after = len(display) - self._command_cursor
+        display_full = self._command_buffer.replace("\n", " ↵ ")
+        prefix_colored = "\033[35m[procy-cmd]\033[0m "
+        prefix_visible_len = len("[procy-cmd] ")
+
+        # Keep command overlay to a single clipped line so long inputs do not
+        # wrap and leave repeated/split artifacts on screen.
+        cols = 120
+        try:
+            cols = os.get_terminal_size(sys.stdout.fileno()).columns
+        except OSError:
+            pass
+        cols = max(cols, 20)
+        max_display = max(1, cols - prefix_visible_len - 1)
+
+        buf_before = self._command_buffer[:self._command_cursor]
+        newline_count = buf_before.count("\n")
+        display_cursor_full = self._command_cursor + newline_count * 2
+        display_cursor_full = max(0, min(display_cursor_full, len(display_full)))
+
+        start = 0
+        if len(display_full) > max_display:
+            start = max(0, display_cursor_full - (max_display - 1))
+            end = start + max_display
+            if end > len(display_full):
+                end = len(display_full)
+                start = max(0, end - max_display)
+            display = display_full[start:end]
+        else:
+            display = display_full
+
+        display_cursor = max(0, min(display_cursor_full - start, len(display)))
+
+        self._echo("\r\033[2K\033[?25h" + prefix_colored + display + "\033[0m")
+        chars_after = len(display) - display_cursor
         if chars_after > 0:
             self._echo(f"\033[{chars_after}D")
 
     def _on_output(self, data: bytes):
         now = time.time()
         with self._state_lock:
+            if self._command_mode and not self._command_silent and not self._evolving:
+                # Agent resumed output while local command editor is open.
+                # Hide overlay to prevent interleaving/flicker.
+                self._command_silent = True
+                self._echo("\r\033[2K\033[?25l")
             self._output_seq += 1
             if self.session_id and data:
                 try:
@@ -844,6 +1000,11 @@ class Procy:
         if not parts:
             return
         cmd = parts[0].lower()
+        if self._evolving and cmd not in {
+            "!status", "!help", "!stop", "!reset-evolve", "!evolve-status", "!estatus", "!history"
+        }:
+            _err("evolve is running; command rejected. Use !status or !stop.")
+            return
         if cmd == "!help":
             self._show_help()
         elif cmd == "!evolve":
@@ -889,17 +1050,22 @@ class Procy:
                 _info("evolve state reset")
         elif cmd == "!eval":
             self._handle_eval_command(parts[1:])
+        elif cmd == "!deploy":
+            self._handle_deploy_command(parts[1:])
         else:
             _err(f"unknown command: {cmd}. Type !help")
 
     def _show_help(self):
         _info("Commands:")
-        _dim("!evolve N    — auto-generate N prompt variants via Qwen")
+        _dim(f"!evolve N    — run N evolution iterations (policy: {self.evolve_policy})")
         _dim("!estatus     — show evolve status/progress")
         _dim("!correct     — correct the last prompt (logs for SFT training)")
         _dim("!status      — session info")
         _dim("!history     — prompt/correction history")
-        _dim("!train       — export SFT training pairs as JSONL")
+        _dim("!train       — train LoRA on all GPUs (stops/restarts inference)")
+        _dim("!deploy trained   — switch to trained LoRA model")
+        _dim("!deploy base      — switch to base model (no LoRA)")
+        _dim("!deploy status    — show running containers & LoRA availability")
         _dim("!stop        — stop ongoing evolve")
         _dim("!reset-evolve— clear stuck evolve state")
         _dim("!eval set <path>         — set evaluator script for this session")
@@ -918,6 +1084,7 @@ class Procy:
         _dim(f"db: {self.store.db_path}")
         if self.qwen_url:
             _dim(f"qwen: {self.qwen_url}")
+        _dim(f"evolve policy: {self.evolve_policy}")
         with self._state_lock:
             cur, total = self._evolve_progress
             alive = bool(self._evolve_thread and self._evolve_thread.is_alive())
@@ -1013,25 +1180,23 @@ class Procy:
             eval_desc = desc if desc else f"the task: {task_context[:200]}"
             eval_path = (Path(self.cwd) / "eval.py").resolve()
             prompt = (
-                f"Create or overwrite exactly this file: {eval_path}\n\n"
-                f"Write a Python evaluator script for {eval_desc}.\n\n"
-                "Requirements:\n"
-                "- It should print exactly one JSON line to stdout with numeric metrics.\n"
-                "- Example: print(json.dumps({\"accuracy\": 0.95, \"latency_ms\": 42.1}))\n"
-                "- Exit code 0 on success.\n"
-                "- It runs from the current project root.\n"
-                "- Keep it self-contained.\n\n"
-                "Important:\n"
-                "- Use the file-writing tool to save it directly to that path.\n"
-                "- Do not ask me to copy/paste code.\n"
-                "- Do NOT print the script source in chat.\n"
-                "- After writing, briefly summarize what it evaluates (2-4 bullets).\n"
-                "- Explicitly state the full path of the file you wrote.\n"
-                "- End with: 'WROTE eval.py'."
+                f"Write a Python evaluator script and save it to {eval_path}. "
+                f"{eval_desc} "
+                "Output format: the script must print exactly one JSON line to stdout with the metrics described above as numeric values, "
+                "e.g. print(json.dumps({{\"metric1\": 0.95, \"metric2\": 1200}})). "
+                "Exit 0 on success. Keep it self-contained. "
+                "Define METRICS_SCHEMA at the top listing each metric with name, type, and goal (maximize or minimize). "
+                "Write the file directly, do not print it in chat. "
+                "After writing, briefly say what it measures and end with: WROTE eval.py"
             )
+            # Wait for agent to be ready, then inject
+            _info("waiting for Claude to be ready...")
+            if not self._wait_for_agent_prompt(timeout=30):
+                _err("Claude doesn't seem to be at a prompt. Try again when Claude is idle.")
+                return
             self._inject_prompt(prompt)
             self._start_eval_autoset(eval_path, name="default", timeout_s=240)
-            _info(f"generation request sent; waiting for {eval_path.name} to appear...")
+            _info(f"prompt sent to Claude; waiting for {eval_path.name} to appear...")
             _dim("once written, procy auto-registers it. Use !eval show to confirm.")
 
         elif sub == "show":
@@ -1055,11 +1220,22 @@ class Procy:
                 return
             _info(f"running evaluator '{ev['name']}'...")
             result = self._run_evaluator(ev)
+            raw = (result.get("raw_output") or "").strip()
+            last_line = self._last_nonempty_line(raw) or self._last_eval_log_line()
+            tail_msg = last_line[:220] if last_line else "(no evaluator output)"
             if result["exit_code"] == 0:
-                _info(f"eval complete: {json.dumps(result['metrics'], indent=2)}")
+                _info("eval complete")
+                _dim(f"log tail: {tail_msg}")
+                metrics = result.get("metrics") or {}
+                if isinstance(metrics, dict) and metrics:
+                    for k, v in metrics.items():
+                        _dim(f"{k} = {v}")
+                else:
+                    _dim("no JSON metrics parsed from evaluator output")
             else:
                 _err(f"eval failed (exit {result['exit_code']})")
-                if result.get("raw_output"):
+                _dim(f"log tail: {tail_msg}")
+                if not last_line and result.get("raw_output"):
                     _dim(result["raw_output"][:500])
 
         elif sub == "metrics":
@@ -1287,7 +1463,27 @@ class Procy:
 
     def _detect_metrics_schema(self, script_content: str) -> list[dict]:
         """Try to detect metric names from evaluator script output JSON keys."""
-        import re
+        m_schema = re.search(r"METRICS_SCHEMA\s*=\s*(\[[\s\S]*?\])", script_content)
+        if m_schema:
+            try:
+                parsed = ast.literal_eval(m_schema.group(1))
+                if isinstance(parsed, list):
+                    normalized: list[dict] = []
+                    for item in parsed:
+                        if not isinstance(item, dict):
+                            continue
+                        name = str(item.get("name") or "").strip()
+                        if not name:
+                            continue
+                        goal = str(item.get("goal") or "maximize").strip().lower()
+                        if goal not in ("maximize", "minimize"):
+                            goal = "maximize"
+                        mtype = str(item.get("type") or "float").strip().lower() or "float"
+                        normalized.append({"name": name, "type": mtype, "goal": goal})
+                    if normalized:
+                        return normalized[:20]
+            except Exception:
+                pass
         keys_found = set()
         for m in re.finditer(r'json\.dumps\s*\(\s*\{([^}]+)\}', script_content):
             block = m.group(1)
@@ -1311,6 +1507,19 @@ class Procy:
                 goal = "minimize"
             schema.append({"name": key, "type": "float", "goal": goal})
         return schema[:10]
+
+    def _infer_metrics_schema_from_metrics(self, metrics: dict) -> list[dict]:
+        schema = []
+        for key, val in metrics.items():
+            if not isinstance(key, str):
+                continue
+            mtype = "float" if isinstance(val, (int, float)) else "str"
+            goal = "maximize"
+            if any(w in key.lower() for w in ("time", "latency", "error", "loss",
+                                              "cost", "memory", "mem", "size")):
+                goal = "minimize"
+            schema.append({"name": key, "type": mtype, "goal": goal})
+        return schema
 
     def _run_evaluator(self, evaluator: dict, evolve_run_id: int | None = None,
                         iteration: int | None = None) -> dict:
@@ -1345,17 +1554,34 @@ class Procy:
         changed = self._get_changed_files()
         if changed:
             env["PROCY_FILES_CHANGED"] = "\n".join(changed)
+        log_path = Path(self.cwd) / "eval.log"
         start = time.time()
         try:
-            result = sp.run(
-                cmd, shell=True, capture_output=True, text=True,
-                timeout=300, cwd=self.cwd, env=env,
-            )
+            # Stream output to eval.log so user can tail it
+            with open(log_path, "w") as log_f:
+                proc = sp.Popen(
+                    cmd, shell=True, stdout=sp.PIPE, stderr=sp.STDOUT,
+                    text=True, cwd=self.cwd, env=env,
+                )
+                output_lines = []
+                while True:
+                    line = proc.stdout.readline()
+                    if not line and proc.poll() is not None:
+                        break
+                    if line:
+                        output_lines.append(line)
+                        log_f.write(line)
+                        log_f.flush()
+                    elapsed = time.time() - start
+                    if elapsed > 600:
+                        proc.kill()
+                        output_lines.append("KILLED: timeout 600s\n")
+                        break
+                proc.wait(timeout=5)
             duration = time.time() - start
-            raw_output = result.stdout.strip()
+            raw_output = "".join(output_lines).strip()
             metrics = {}
-            lines = raw_output.split("\n")
-            for line in reversed(lines):
+            for line in reversed(raw_output.split("\n")):
                 line = line.strip()
                 if line.startswith("{"):
                     try:
@@ -1367,10 +1593,18 @@ class Procy:
             self.store.log_eval_result(
                 self.session_id, evaluator["id"],
                 metrics=metrics, raw_output=raw_output[:8000],
-                exit_code=result.returncode, duration_s=duration,
+                exit_code=proc.returncode, duration_s=duration,
                 trace_metrics=trace_metrics,
                 evolve_run_id=evolve_run_id, iteration=iteration,
             )
+            if metrics and not evaluator.get("metrics_schema"):
+                inferred = self._infer_metrics_schema_from_metrics(metrics)
+                if inferred:
+                    try:
+                        self.store.update_evaluator_metrics_schema(evaluator["id"], inferred)
+                        evaluator["metrics_schema"] = inferred
+                    except Exception:
+                        pass
             if evolve_run_id and metrics:
                 schema = evaluator.get("metrics_schema", [])
                 primary = schema[0]["name"] if schema else next(iter(metrics), None)
@@ -1381,13 +1615,31 @@ class Procy:
                 "metrics": metrics,
                 "trace_metrics": trace_metrics,
                 "raw_output": raw_output,
-                "exit_code": result.returncode,
+                "exit_code": proc.returncode,
                 "duration_s": duration,
             }
-        except sp.TimeoutExpired:
-            return {"metrics": {}, "raw_output": "timeout", "exit_code": -1, "duration_s": 300}
         except Exception as e:
             return {"metrics": {}, "raw_output": str(e), "exit_code": -1, "duration_s": 0}
+
+    def _last_nonempty_line(self, text: str) -> str:
+        if not text:
+            return ""
+        for ln in reversed(text.splitlines()):
+            ln = ln.strip()
+            if ln:
+                return ln
+        return ""
+
+    def _last_eval_log_line(self) -> str:
+        """Best-effort tail(1) for eval.log in cwd."""
+        try:
+            p = Path(self.cwd) / "eval.log"
+            if not p.exists():
+                return ""
+            data = p.read_text(errors="replace")
+            return self._last_nonempty_line(data)
+        except Exception:
+            return ""
 
     def _get_changed_files(self) -> list[str]:
         """Return deduplicated list of files Claude wrote/edited this session."""
@@ -1446,18 +1698,153 @@ class Procy:
         _info("Correction logged. Use !train to export.")
 
     def _do_train(self):
+        """Full training lifecycle: stop inference → train LoRA → restart inference."""
         pairs = self.store.get_training_pairs()
-        if not pairs:
-            _err("no corrections to train from")
+        all_data = self.store.get_training_data_all()
+        sft_rows = [d for d in all_data if d.get("category") in ("human", "corrected")]
+        if not sft_rows and not pairs:
+            _err("no training data (need human prompts or corrections)")
             return
-        out_path = Path(self.cwd) / "procy_train.jsonl"
-        with open(out_path, "w") as f:
-            for p in pairs:
-                f.write(json.dumps({
-                    "instruction": p["original_prompt"],
-                    "output": p["corrected_prompt"],
-                }) + "\n")
-        _info(f"exported {len(pairs)} pairs to {out_path}")
+        _info(f"training data: {len(sft_rows)} SFT examples, {len(pairs)} correction pairs")
+
+        def run():
+            try:
+                self._train_lifecycle(sft_rows)
+            except Exception as exc:
+                import traceback
+                _err(f"train failed: {exc}")
+                _dim(traceback.format_exc()[:500])
+
+        t = threading.Thread(target=run, daemon=True, name="procy-train")
+        t.start()
+        _info("training started in background. Use !deploy status to check.")
+
+    def _train_lifecycle(self, sft_rows):
+        """Stop inference → export data → train LoRA → restart with LoRA."""
+        host = QWEN_SSH_HOST
+
+        # 1. Export training data
+        _dim("exporting training data...")
+        sft_lines = []
+        for d in sft_rows:
+            sft_lines.append(json.dumps({
+                "instruction": d.get("context") or "Generate the next prompt.",
+                "input": d.get("agent_response", "") or "",
+                "output": d["prompt"],
+                "category": d["category"],
+            }))
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write("\n".join(sft_lines))
+            tmp_path = f.name
+
+        script_path = Path(__file__).resolve().parent.parent / "scripts" / "train_proxy.py"
+
+        # 2. Upload data
+        _dim(f"uploading to {host}:/tmp/procy_train/ ...")
+        subprocess.run(["ssh", host, "mkdir -p /tmp/procy_train"], check=True, capture_output=True, timeout=10)
+        subprocess.run(["scp", tmp_path, f"{host}:/tmp/procy_train/train.jsonl"], check=True, capture_output=True, timeout=30)
+        if script_path.exists():
+            subprocess.run(["scp", str(script_path), f"{host}:/tmp/procy_train/train_proxy.py"], check=True, capture_output=True, timeout=30)
+        Path(tmp_path).unlink(missing_ok=True)
+
+        # 3. Stop inference containers to free GPUs
+        _info("stopping inference containers...")
+        _gpu_stop_inference(host)
+
+        # 4. Run training on all GPUs
+        _info(f"training LoRA on {QWEN_NUM_GPUS} GPUs...")
+        docker_cmd = (
+            f"docker run --gpus all --rm --name procy_train_job"
+            f" --entrypoint bash"
+            f" -v /tmp/procy_train:/data"
+            f" -v /dev/shm/hf_cache:/root/.cache/huggingface"
+            f" -v {LORA_PATH}:/output"
+            f" -e HF_HOME=/root/.cache/huggingface"
+            f" vllm/vllm-openai:latest"
+            f" -c 'pip install peft trl datasets accelerate 2>&1 | tail -3"
+            f" && python3 /data/train_proxy.py"
+            f" --data /data/train.jsonl"
+            f" --output /output/latest"
+            f" --model {QWEN_MODEL_ID}"
+            f" --epochs 3"
+            f" --lr 2e-4"
+            f" 2>&1'"
+        )
+        subprocess.run(["ssh", host, "docker rm -f procy_train_job"], capture_output=True, timeout=10)
+        result = subprocess.run(
+            ["ssh", host, docker_cmd],
+            capture_output=True, text=True, timeout=1800,
+        )
+        if result.returncode != 0:
+            _err(f"training failed (exit {result.returncode})")
+            if result.stderr:
+                _dim(result.stderr[-500:])
+            # Restart base inference even if training failed
+            _info("restarting base inference...")
+            _gpu_start_inference(host, use_lora=False)
+            return
+        _info("training complete!")
+        _dim(result.stdout[-300:] if result.stdout else "")
+
+        # 5. Restart inference with trained LoRA
+        _info("restarting inference with trained model...")
+        _gpu_start_inference(host, use_lora=True)
+        _info("deployed trained model on all GPUs")
+
+    def _handle_deploy_command(self, args):
+        if not args:
+            _err("usage: !deploy [trained|base|status]")
+            return
+        sub = args[0].lower()
+        host = QWEN_SSH_HOST
+        if sub == "status":
+            self._show_deploy_status(host)
+        elif sub == "trained":
+            _info("deploying trained model...")
+            t = threading.Thread(target=self._deploy_model, args=(host, True), daemon=True)
+            t.start()
+        elif sub == "base":
+            _info("deploying base model...")
+            t = threading.Thread(target=self._deploy_model, args=(host, False), daemon=True)
+            t.start()
+        else:
+            _err(f"unknown: !deploy {sub}. Use trained|base|status")
+
+    def _deploy_model(self, host, use_lora):
+        try:
+            _gpu_stop_inference(host)
+            _gpu_start_inference(host, use_lora=use_lora)
+            label = "trained (LoRA)" if use_lora else "base"
+            _info(f"deployed {label} model on {QWEN_NUM_GPUS} GPUs")
+        except Exception as exc:
+            _err(f"deploy failed: {exc}")
+
+    def _show_deploy_status(self, host):
+        try:
+            result = subprocess.run(
+                ["ssh", host, "docker ps --format '{{.Names}} {{.Status}}' --filter name=procy_gpu"],
+                capture_output=True, text=True, timeout=10,
+            )
+            containers = result.stdout.strip()
+            if containers:
+                _info(f"running containers:")
+                for line in containers.splitlines():
+                    _dim(line)
+            else:
+                _dim("no inference containers running")
+
+            # Check if LoRA exists
+            result = subprocess.run(
+                ["ssh", host, f"ls -la {LORA_PATH}/latest/adapter_config.json 2>/dev/null"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                _dim(f"trained LoRA available at {LORA_PATH}/latest/")
+            else:
+                _dim("no trained LoRA found")
+        except Exception as exc:
+            _err(f"status check failed: {exc}")
 
     def _start_evolve(self, n: int):
         if n < 1:
@@ -1476,26 +1863,38 @@ class Procy:
             cur, total = self._evolve_progress
             _err(f"evolve already running ({cur}/{total}, state={self._evolve_state}). Use !stop.")
             return
-        # Be permissive: prompt glyph detection can fail on some terminal themes.
-        # Only block when output is still actively streaming.
-        if has_output and quiet_for < 0.25:
-            _err("agent is still outputting; wait a moment, then run !evolve again")
-            return
-        if not last_prompt or not last_prompt.strip():
-            _err("no previous prompt to evolve from")
-            return
-        if not self.qwen_url:
-            _err("no Qwen available. Need --tunnel or --qwen-url")
-            return
-        with self._state_lock:
-            self._evolving = True
-            self._stop_evolve = False
-            self._evolve_state = "starting"
-            self._evolve_progress = (0, n)
-            self._evolve_note = "started"
-        t = threading.Thread(target=self._evolve_loop, args=(n,), daemon=True, name="procy-evolve")
-        self._evolve_thread = t
-        t.start()
+
+        if self.evolve_policy == "fixed":
+            # Fixed policy: templates + Claude via PTY (no Qwen needed)
+            with self._state_lock:
+                self._evolving = True
+                self._stop_evolve = False
+                self._evolve_state = "starting"
+                self._evolve_progress = (0, n)
+                self._evolve_note = f"fixed policy, {n} iterations"
+            t = threading.Thread(target=self._evolve_loop_fixed, args=(n,), daemon=True, name="procy-evolve")
+            self._evolve_thread = t
+            t.start()
+        else:
+            # Proxy policy: generate prompts via Qwen, inject into agent PTY
+            if has_output and quiet_for < 0.25:
+                _err("agent is still outputting; wait a moment, then run !evolve again")
+                return
+            if not last_prompt or not last_prompt.strip():
+                _err("no previous prompt to evolve from")
+                return
+            if not self.qwen_url:
+                _err("no Qwen available. Need --tunnel or --qwen-url")
+                return
+            with self._state_lock:
+                self._evolving = True
+                self._stop_evolve = False
+                self._evolve_state = "starting"
+                self._evolve_progress = (0, n)
+                self._evolve_note = "proxy policy"
+            t = threading.Thread(target=self._evolve_loop, args=(n,), daemon=True, name="procy-evolve")
+            self._evolve_thread = t
+            t.start()
         # Avoid local status prints here; they can shift rows relative to child PTY.
 
     def _evolve_loop(self, n: int):
@@ -1576,6 +1975,8 @@ class Procy:
                         self._evolve_state = "evaluating"
                         self._evolve_note = f"[#{i}] running evaluator..."
                     eval_result = self._run_evaluator(evaluator, evolve_run_id=evolve_id, iteration=i)
+                    raw = (eval_result.get("raw_output") or "").strip()
+                    last_line = self._last_nonempty_line(raw) or self._last_eval_log_line()
                     if eval_result["exit_code"] == 0 and eval_result["metrics"]:
                         schema = evaluator.get("metrics_schema", [])
                         primary = schema[0]["name"] if schema else next(iter(eval_result["metrics"]), None)
@@ -1583,9 +1984,13 @@ class Procy:
                             score = float(eval_result["metrics"][primary])
                         with self._state_lock:
                             self._evolve_note = f"[#{i}] eval: {json.dumps(eval_result['metrics'])}"
+                        if last_line:
+                            _dim(f"[#{i}] eval log tail: {last_line[:220]}")
                     else:
                         with self._state_lock:
                             self._evolve_note = f"[#{i}] eval failed (exit {eval_result['exit_code']})"
+                        if last_line:
+                            _dim(f"[#{i}] eval log tail: {last_line[:220]}")
 
                 evolve_history.append({"iteration": i, "prompt": new_prompt, "response_summary": response_summary, "score": score, "source": "procy"})
                 completed = i
@@ -1612,6 +2017,204 @@ class Procy:
                 self._evolving = False
                 self._stop_evolve = False
                 self._evolve_progress = (completed, n)
+
+    def _evolve_loop_fixed(self, n: int):
+        """Fixed-policy evolve loop: build prompt from templates, inject into Claude via PTY."""
+        from .evolve_engine import EvolveEngine
+        completed = 0
+        try:
+            engine = EvolveEngine(
+                self.store, self.session_id,
+                language="python",
+            )
+
+            # Seed population if empty — snapshot current git state
+            if self.store.count_programs(self.session_id) == 0:
+                commit = self._git_current_commit()
+                engine.seed_population(commit_hash=commit)
+
+            for i in range(1, n + 1):
+                with self._state_lock:
+                    self._evolve_progress = (i - 1, n)
+                    if self._stop_evolve:
+                        self._evolve_state = "stopped"
+                        self._evolve_note = "stopped by user"
+                        break
+                    self._evolve_state = "waiting_prompt"
+                    self._evolve_note = f"waiting for Claude (iteration {i}/{n})"
+
+                # Wait for Claude to be at a prompt
+                if not self._wait_for_agent_prompt(timeout=60):
+                    with self._state_lock:
+                        self._evolve_state = "prompt_timeout"
+                        self._evolve_note = "Claude not at prompt"
+                    break
+
+                # Select parent and build prompt
+                parent = engine.sample_parent()
+                parent_hash = parent.get("commit_hash") if parent else None
+                parent_fitness = parent.get("fitness_score", 0) if parent else 0
+
+                eval_cmd = "python3 eval.py"
+                evaluator = self.store.get_evaluator(self.session_id)
+                if evaluator:
+                    eval_cmd = evaluator.get("run_command", "python3 {script}").replace(
+                        "{script}", evaluator.get("script_path", "eval.py"))
+
+                focus = ""
+                if parent_hash:
+                    focus = f"Start from commit {parent_hash[:8]} (fitness {parent_fitness:.4f}). Run: git checkout {parent_hash[:8]}"
+
+                _system_msg, user_msg = engine.build_prompt(
+                    eval_command=eval_cmd, focus=focus,
+                )
+
+                # Inject into Claude
+                with self._state_lock:
+                    self.turn_num += 1
+                    turn_num = self.turn_num
+                    self.last_human_prompt = user_msg[:500]
+                    self._evolve_state = "injecting"
+                    self._evolve_note = f"[#{i}/{n}] injecting prompt into Claude"
+                    self._evolve_response_buf = ""
+                self.store.log_turn(self.session_id, turn_num, "procy", user_msg[:2000])
+                evolve_id = self.store.log_evolve(self.session_id, i, user_msg[:500], None, None, None, "evolve_engine")
+
+                before_seq = self._output_seq
+                self._inject_prompt(user_msg)
+
+                # Wait for Claude's response (longer timeout — Claude writes files)
+                with self._state_lock:
+                    self._evolve_state = "waiting_response"
+                    self._evolve_note = f"[#{i}/{n}] Claude is working..."
+                if not self._wait_for_agent_response_done(before_seq, timeout=300):
+                    with self._state_lock:
+                        self._evolve_state = "response_timeout"
+                        self._evolve_note = f"[#{i}/{n}] response timeout"
+                    break
+
+                # Capture response summary
+                with self._state_lock:
+                    response_text = _clean_for_db(self._evolve_response_buf)
+                    self._evolve_response_buf = ""
+                response_summary = response_text[:4000] if response_text else ""
+                self.store.update_evolve_response(evolve_id, response_summary)
+
+                # Commit Claude's changes
+                commit_hash = self._git_commit_evolve(i)
+
+                # Run evaluator
+                score = None
+                metrics = {}
+                evaluator = self.store.get_evaluator(self.session_id)
+                if evaluator:
+                    with self._state_lock:
+                        self._evolve_state = "evaluating"
+                        self._evolve_note = f"[#{i}/{n}] running evaluator..."
+                    eval_result = self._run_evaluator(evaluator, evolve_run_id=evolve_id, iteration=i)
+                    raw = (eval_result.get("raw_output") or "").strip()
+                    last_line = self._last_nonempty_line(raw) or self._last_eval_log_line()
+                    if eval_result["exit_code"] == 0 and eval_result["metrics"]:
+                        metrics = eval_result["metrics"]
+                        schema = evaluator.get("metrics_schema", [])
+                        primary = schema[0]["name"] if schema else next(iter(metrics), None)
+                        if primary and primary in metrics:
+                            score = float(metrics[primary])
+                        pass
+                    # Don't print to stdout during evolve — it corrupts Claude's TUI
+
+                # Add to population
+                if commit_hash:
+                    fitness = score if score is not None else 0.0
+                    best = self.store.get_best_program(self.session_id)
+                    best_fitness = best.get("fitness_score", 0) if best else 0
+                    improved = fitness > best_fitness
+                    engine.add_to_population(
+                        commit_hash=commit_hash,
+                        parent_id=parent["id"] if parent else None,
+                        metrics=metrics, fitness_score=fitness,
+                        changes_description=response_summary[:200] if response_summary else f"iter {i}",
+                    )
+
+                self.store.update_evolve_score(evolve_id, metrics if metrics else None, score)
+                engine.maybe_migrate()
+
+                completed = i
+                with self._state_lock:
+                    self._evolve_progress = (completed, n)
+                    self._evolve_state = "running"
+                    note = f"[#{i}/{n}]"
+                    if score is not None:
+                        note += f" score={score:.4f}"
+                    if response_summary:
+                        note += f" ({len(response_summary)} chars)"
+                    self._evolve_note = note
+                time.sleep(0.2)
+
+        except Exception as exc:
+            import traceback
+            with self._state_lock:
+                self._evolve_state = "error"
+                self._evolve_note = f"crashed: {exc}"
+            pass  # error stored in _evolve_note
+        finally:
+            with self._state_lock:
+                if completed >= n and n > 0:
+                    self._evolve_state = "idle"
+                    best = self.store.get_best_program(self.session_id)
+                    bf = best.get("fitness_score", 0) if best else 0
+                    self._evolve_note = f"completed {completed}/{n}, best={bf:.4f}"
+                elif self._evolve_state not in ("error", "stopped", "prompt_timeout", "response_timeout"):
+                    self._evolve_state = "idle"
+                    if not self._evolve_note:
+                        self._evolve_note = f"finished ({completed}/{n})"
+                self._evolving = False
+                self._stop_evolve = False
+                self._evolve_progress = (completed, n)
+
+    def _git_current_commit(self) -> str | None:
+        """Get current HEAD commit hash."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5, cwd=self.cwd,
+            )
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    def _git_commit_evolve(self, iteration: int) -> str | None:
+        """Commit all changes and create a branch to anchor the commit."""
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=5, cwd=self.cwd,
+            )
+            if not status.stdout.strip():
+                return self._git_current_commit()
+
+            subprocess.run(
+                ["git", "add", "-A"],
+                capture_output=True, timeout=5, cwd=self.cwd,
+            )
+            sid = (self.session_id or "")[:8]
+            result = subprocess.run(
+                ["git", "commit", "-m", f"procy evolve {sid} iter {iteration}"],
+                capture_output=True, text=True, timeout=10, cwd=self.cwd,
+            )
+            if result.returncode != 0:
+                return None
+            commit = self._git_current_commit()
+            if commit:
+                # Create a branch so the commit is never GC'd
+                branch = f"evolve/{sid}/{iteration}"
+                subprocess.run(
+                    ["git", "branch", "-f", branch, commit],
+                    capture_output=True, timeout=5, cwd=self.cwd,
+                )
+            return commit
+        except Exception:
+            return None
 
     def _is_agent_prompt_visible(self) -> bool:
         tail = self._captured_output[-4000:] if self._captured_output else b""
@@ -1710,9 +2313,9 @@ class Procy:
             {"role": "user", "content": "\n".join(user_parts)},
         ]
 
-        # Use the LoRA-adapted proxy model
+        # Use the proxy model (base or LoRA-adapted)
         payload = json.dumps({
-            "model": "proxy",
+            "model": QWEN_SERVED_NAME,
             "messages": messages,
             "max_tokens": 500,
             "temperature": 0.7,
@@ -1731,9 +2334,18 @@ class Procy:
             return None
 
     def _inject_prompt(self, prompt: str):
-        if self._proxy and self._proxy.master_fd:
-            # Write only to child PTY; avoid local cursor movement that can desync rows.
-            os.write(self._proxy.master_fd, (prompt + "\r").encode())
+        if self._proxy:
+            # Flatten to single line, send via injection pipe (thread-safe,
+            # forwarded to master_fd by the proxy_loop's main thread).
+            flat = prompt.replace("\n", " ").replace("\r", "")
+            # Use bracketed paste for single TUI redraw
+            data = b"\x1b[200~" + flat.encode("utf-8", errors="replace") + b"\x1b[201~"
+            self._proxy.inject(data)
+            # Delay then Enter — must be a separate inject so the TUI
+            # processes the paste first, then sees Enter as a new event.
+            time.sleep(0.3)
+            self._proxy.inject(b"\r")
+            os.write(fd, b"\r")
 
     def _is_claude_command(self) -> bool:
         if not self.agent_cmd:
@@ -1811,9 +2423,10 @@ class Procy:
         self._configure_agent_resume()
 
         if self.resume_procy:
-            _info(f"resumed session {self.session_id[:8]} (turn={self.turn_num})")
+            _info(f"resumed session {self.session_id} (turn={self.turn_num})")
         else:
-            _info(f"session {self.session_id[:8]}")
+            _info(f"session {self.session_id}")
+        _dim(f"resume: procy --resume-procy {self.session_id[:8]}")
         _dim(f"agent: {' '.join(self.agent_cmd)}")
         _dim(f"db: {self.store.db_path}")
         if self.qwen_url:
@@ -1837,7 +2450,9 @@ class Procy:
         with self._state_lock:
             self._flush_agent_log_locked(force=True)
         self.store.end_session(self.session_id)
-        _info(f"session ended. traces: {self.store.db_path}")
+        _info(f"session ended: {self.session_id}")
+        _dim(f"resume: procy --resume-procy {self.session_id[:8]}")
+        _dim(f"traces: {self.store.db_path}")
         return exit_code
 
 
@@ -1866,6 +2481,9 @@ def main():
                         help="don't auto-start SSH tunnel to EXP07")
     parser.add_argument("--ui-port", type=int, default=7862,
                         help="monitor UI port (default: 7862)")
+    parser.add_argument("--evolve-policy", default="fixed",
+                        choices=["fixed", "proxy"],
+                        help="evolve policy: 'fixed' (OpenEvolve-style templates) or 'proxy' (Qwen LLM policy)")
     args = parser.parse_args()
 
     tunnel_proc = None
@@ -1896,6 +2514,7 @@ def main():
         db_path=args.db,
         qwen_url=qwen_url,
         resume_procy=args.resume_procy,
+        evolve_policy=args.evolve_policy,
     )
 
     try:

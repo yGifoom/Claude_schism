@@ -39,7 +39,7 @@ REMOTE_WORK_DIR = "/tmp/procy_ann_bench"
 def call_qwen(prompt: str, temperature: float = 0.7) -> str:
     """Call Qwen 32B via local tunnel."""
     payload = json.dumps({
-        "model": "Qwen/Qwen2.5-32B-Instruct",
+        "model": "Qwen/Qwen3.5-27B",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 2000,
         "temperature": temperature,

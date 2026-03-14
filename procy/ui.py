@@ -214,7 +214,7 @@ def api_training_start():
             return jsonify({"error": "Training already running"}), 409
 
     body = request.get_json(silent=True) or {}
-    model = body.get("model", "Qwen/Qwen2.5-14B-Instruct")
+    model = body.get("model", "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4")
     epochs = body.get("epochs", 3)
     lr = body.get("lr", 2e-4)
     host = body.get("host", "EXP07")
@@ -358,9 +358,11 @@ INDEX_HTML = r"""<!doctype html>
     header { padding:14px 20px; border-bottom:1px solid var(--border); background:rgba(255,255,255,.72); backdrop-filter:blur(6px); position:sticky; top:0; z-index:5; }
     .title { font-size:18px; font-weight:700; }
     .subtitle { font-size:12px; color:var(--muted); margin-top:4px; }
-    .layout { display:grid; grid-template-columns:300px 1fr; gap:12px; padding:12px; min-height:calc(100vh - 66px); }
+    .layout { padding:12px; }
+    .layout.show-sessions { display:grid; grid-template-columns:300px 1fr; gap:12px; }
     .panel { background:var(--card); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
     .panel h2 { margin:0; font-size:13px; padding:10px 12px; border-bottom:1px solid var(--border); color:var(--accent); text-transform:uppercase; letter-spacing:.03em; }
+    #sessions-panel.hidden { display:none; }
     .row { display:flex; align-items:center; justify-content:space-between; gap:8px; }
     .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:12px; }
     .pill { border-radius:999px; border:1px solid var(--border); padding:2px 8px; font-size:11px; line-height:1.5; white-space:nowrap; }
@@ -418,9 +420,10 @@ INDEX_HTML = r"""<!doctype html>
 
     .status-note { font-size:12px; margin-top:8px; color:var(--muted); }
     .terminal-wrap { border:1px solid var(--border); border-radius:8px; overflow:hidden; background:#f8faf8; overscroll-behavior: contain; }
-    .terminal-host { height:62vh; padding:6px; overscroll-behavior: contain; }
+    .terminal-host { height:calc(100vh - 180px); padding:6px; overscroll-behavior: contain; }
     #slide-terminal { overscroll-behavior: contain; }
     .xterm .xterm-viewport { overscroll-behavior: contain; }
+    .xterm { height:100% !important; }
 
     @media (max-width:1000px) { .layout { grid-template-columns:1fr; } :root { --slide-left-w: 92vw; --slide-right-w: 96vw; } }
   </style>
@@ -430,14 +433,14 @@ INDEX_HTML = r"""<!doctype html>
     <div class="title">ProCy Monitor</div>
     <div class="subtitle">Human prompt (left, green). Agent response (right, gold). ProCy evolve prompts (violet). Click prompts to correct for training.</div>
   </header>
-  <main class="layout">
-    <section class="panel">
+  <main id="main-layout" class="layout show-sessions">
+    <section id="sessions-panel" class="panel">
       <h2>Sessions</h2>
       <div id="sessions"></div>
     </section>
     <section class="panel">
-      <h2>Workspace</h2>
       <div class="tabbar">
+        <button id="btn-back" style="display:none;font-size:11px;padding:4px 8px" onclick="showSessions()">← Sessions</button>
         <button id="tab-interactions" class="tab-btn active" onclick="selectTab('interactions')">Interactions</button>
         <button id="tab-terminal" class="tab-btn" onclick="selectTab('terminal')">Terminal</button>
         <button id="tab-evolve" class="tab-btn" onclick="selectTab('evolve')">Evolve</button>
@@ -488,7 +491,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <script>
-    const state = { sessions:[], selectedId:null, sessionData:null, sessionFingerprint:'', activeTab:'interactions', editTarget:null, showAllCorrections:false, term:null, termFit:null, terminalSessionId:null, slideTerm:null, slideTermFit:null, refreshInFlight:false };
+    const state = { sessions:[], selectedId:null, sessionData:null, sessionFingerprint:'', activeTab:'interactions', editTarget:null, showAllCorrections:false, term:null, termFit:null, terminalSessionId:null, termAfterId:0, slideTerm:null, slideTermFit:null, refreshInFlight:false };
     const _assetLoadPromises = {};
     const _loadedCssHrefs = new Set();
 
@@ -548,7 +551,19 @@ INDEX_HTML = r"""<!doctype html>
 
     function cleanTraceText(s) {
       if(s===null||s===undefined) return '';
-      return String(s).replace(/\r/g,'');
+      const raw = String(s).replace(/\r/g,'');
+      const cleaned = raw
+        .split('\n')
+        .map((ln)=>ln.replace(/\u001b\[[0-9;]*[A-Za-z]/g,''))
+        .filter((ln)=>{
+          const t = ln.trim();
+          if(!t) return false;
+          // Drop prompt marker residue like "|" or ">" that sometimes leaks
+          // into stored turns from terminal integrations.
+          if(/^[|>›❯\\\[\]]+$/.test(t)) return false;
+          return true;
+        });
+      return cleaned.join('\n').replace(/\n{3,}/g,'\n\n').trim();
     }
     function esc(s) { if(s===null||s===undefined) return ''; return String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;'); }
     function excerpt(s, n=260) { if(!s) return ''; const r=cleanTraceText(s); return r.length<=n?r:r.slice(0,n)+'...'; }
@@ -572,7 +587,7 @@ INDEX_HTML = r"""<!doctype html>
       ].join('|');
     }
     function getWorkspaceScroller() {
-      return document.getElementById('interactions-scroller') || document.querySelector('#details .tab-scroll');
+      return document.documentElement;
     }
     async function apiGet(url) {
       return fetch(url, { cache: 'no-store' });
@@ -629,6 +644,10 @@ INDEX_HTML = r"""<!doctype html>
 
     async function selectSession(id) {
       state.selectedId=id; renderSessions();
+      // Hide sessions panel, show back button
+      document.getElementById('sessions-panel').classList.add('hidden');
+      document.getElementById('main-layout').classList.remove('show-sessions');
+      document.getElementById('btn-back').style.display='';
       try {
         const r=await apiGet('/api/sessions/'+id);
         state.sessionData=await r.json();
@@ -637,31 +656,40 @@ INDEX_HTML = r"""<!doctype html>
       renderWorkspace();
     }
 
+    function showSessions() {
+      document.getElementById('sessions-panel').classList.remove('hidden');
+      document.getElementById('main-layout').classList.add('show-sessions');
+      document.getElementById('btn-back').style.display='none';
+    }
+
     async function refresh() {
       if(state.refreshInFlight) return;
       state.refreshInFlight = true;
       try {
         await fetchSessions();
+        if(state.activeTab==='terminal' && state.selectedId && state.term && state.terminalSessionId===state.selectedId) {
+          await refreshTerminalIncremental();
+        }
         if(state.selectedId) {
           try {
-            const scroller = getWorkspaceScroller();
-            const oldTop = scroller ? scroller.scrollTop : 0;
-            const wasNearBottom = scroller
-              ? ((scroller.scrollHeight - (scroller.scrollTop + scroller.clientHeight)) < 24)
-              : false;
+            const oldTop = window.scrollY;
+            const wasNearBottom = (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 24);
             const r=await apiGet('/api/sessions/'+state.selectedId);
             const newData=await r.json();
             const newFp=getDataFingerprint(newData);
             const changed = newFp !== state.sessionFingerprint;
             state.sessionData=newData;
-            if(changed) state.sessionFingerprint=newFp;
-            if(changed || state.activeTab==='interactions') {
-              renderWorkspace();
-              const newScroller = getWorkspaceScroller();
-              if(newScroller) {
-                if(wasNearBottom) newScroller.scrollTop = newScroller.scrollHeight;
-                else newScroller.scrollTop = oldTop;
+            if(changed) {
+              state.sessionFingerprint=newFp;
+              // Avoid tearing down xterm while user is scrolling terminal replay.
+              if(state.activeTab==='terminal' && state.term && state.terminalSessionId===state.selectedId) {
+                // Keep existing terminal; we already did incremental refresh above.
+              } else {
+                renderWorkspace();
               }
+              // Restore scroll position — only auto-scroll if user was at bottom
+              if(wasNearBottom) window.scrollTo(0, document.documentElement.scrollHeight);
+              else window.scrollTo(0, oldTop);
             }
           } catch(e){}
         }
@@ -746,15 +774,9 @@ INDEX_HTML = r"""<!doctype html>
       }).join('');
 
       const corrCount = corrections.length;
-      el.innerHTML=`<div class="content">
-        <div class="row"><div><b>${esc(session.goal||'procy session')}</b><div class="small muted mono">${esc(session.id||'')}</div><div class="small muted">${fmtTs(session.started_at)}</div></div><span class="pill ${session.status==='running'?'ok':'muted'}">${esc(session.status||'')}</span></div>
-        <div class="summary-grid">
-          <div class="metric"><b>Prompts</b><br/>${promptCount}</div>
-          <div class="metric"><b>Responses</b><br/>${responseCount}</div>
-          <div class="metric"><b>Corrections</b><br/>${corrCount}</div>
-          <div class="metric"><b>Status</b><br/>${esc(session.status||'-')}</div>
-        </div>
-        <div id="interactions-scroller" class="tab-scroll" style="margin-top:12px;max-height:calc(100vh - 280px);overflow-y:auto;padding-right:4px">${sequenceHtml||'<div class="muted">No interactions yet.</div>'}</div>
+      el.innerHTML=`<div style="padding:6px 12px">
+        <div class="row" style="margin-bottom:6px"><div><b>${esc(session.goal||'procy session')}</b> <span class="small muted mono">${esc((session.id||'').slice(0,8))}</span></div><span class="pill ${session.status==='running'?'ok':'muted'}">${esc(session.status||'')}</span><span class="small muted">${promptCount}p/${responseCount}r/${corrCount}c</span></div>
+        <div id="interactions-scroller">${sequenceHtml||'<div class="muted">No interactions yet.</div>'}</div>
       </div>`;
     }
 
@@ -835,9 +857,15 @@ INDEX_HTML = r"""<!doctype html>
       attachTerminalWheelGuard(host);
       if (state.termFit) {
         try { state.termFit.fit(); } catch(e) {}
+        // Re-fit on resize
+        const ro = new ResizeObserver(() => {
+          try { if(state.termFit) state.termFit.fit(); } catch(e) {}
+        });
+        ro.observe(host);
       }
       state.term.focus();
       state.terminalSessionId = state.selectedId;
+      state.termAfterId = 0;
       state.term.write('\x1b[2J\x1b[H');
       let afterId = 0;
       const page = 5000;
@@ -852,6 +880,33 @@ INDEX_HTML = r"""<!doctype html>
           applyTerminalEvent(state.term, evt);
         }
         if(events.length < page) break;
+      }
+      state.termAfterId = afterId;
+    }
+
+    async function refreshTerminalIncremental() {
+      if(!state.selectedId || !state.term || state.terminalSessionId!==state.selectedId) return;
+      const host = document.getElementById('terminal-host');
+      const viewport = host ? host.querySelector('.xterm-viewport') : null;
+      const wasNearBottom = !viewport || ((viewport.scrollTop + viewport.clientHeight) >= (viewport.scrollHeight - 8));
+      let afterId = Number(state.termAfterId || 0);
+      let wrote = false;
+      const page = 5000;
+      for (let i = 0; i < 6; i++) {
+        const r = await apiGet(`/api/terminal/${encodeURIComponent(state.selectedId)}?after_id=${afterId}&limit=${page}`);
+        if(!r.ok) break;
+        const data = await r.json();
+        const events = data.events || [];
+        if(!events.length) break;
+        for (const evt of events) {
+          afterId = evt.id;
+          wrote = applyTerminalEvent(state.term, evt) || wrote;
+        }
+        if(events.length < page) break;
+      }
+      state.termAfterId = afterId;
+      if(wrote && wasNearBottom) {
+        state.term.scrollToBottom();
       }
     }
 
@@ -872,6 +927,9 @@ INDEX_HTML = r"""<!doctype html>
     function renderEvolve() {
       const el=document.getElementById('details');
       if(!state.selectedId) { el.innerHTML='<div class="content muted">Select a session.</div>'; return; }
+      const prevList = document.getElementById('evolve-list');
+      const prevTop = prevList ? prevList.scrollTop : 0;
+      const prevNearBottom = !!(prevList && (prevList.scrollTop + prevList.clientHeight) >= (prevList.scrollHeight - 12));
       Promise.all([
         apiGet('/api/evolves/'+state.selectedId).then(r=>r.json()),
         apiGet('/api/evaluator/'+state.selectedId).then(r=>r.json()),
@@ -914,7 +972,7 @@ INDEX_HTML = r"""<!doctype html>
           return;
         }
         html+=`<div class="row" style="margin-bottom:8px"><b>Evolve Tries (${evolves.length})</b></div>`;
-        html+='<div style="max-height:calc(100vh - 400px);overflow-y:auto;padding-right:4px">';
+        html+='<div id="evolve-list" style="max-height:calc(100vh - 400px);overflow-y:auto;padding-right:4px">';
 
         // Match eval results to evolve iterations
         const evalByIter = {};
@@ -965,6 +1023,11 @@ INDEX_HTML = r"""<!doctype html>
         });
         html+='</div></div>';
         el.innerHTML=html;
+        const nextList = document.getElementById('evolve-list');
+        if(nextList && prevList) {
+          if(prevNearBottom) nextList.scrollTop = nextList.scrollHeight;
+          else nextList.scrollTop = Math.min(prevTop, Math.max(0, nextList.scrollHeight - nextList.clientHeight));
+        }
       });
     }
 
@@ -1069,7 +1132,7 @@ INDEX_HTML = r"""<!doctype html>
               </div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">
-              <div><label>Model</label><input type="text" id="train-model" value="Qwen/Qwen2.5-14B-Instruct" style="font-size:11px"/></div>
+              <div><label>Model</label><input type="text" id="train-model" value="Qwen/Qwen3.5-27B" style="font-size:11px"/></div>
               <div><label>Epochs</label><input type="text" id="train-epochs" value="3" /></div>
               <div><label>Learning Rate</label><input type="text" id="train-lr" value="0.0002" /></div>
             </div>
@@ -1100,7 +1163,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function startTraining() {
-      const model = document.getElementById('train-model')?.value || 'Qwen/Qwen2.5-14B-Instruct';
+      const model = document.getElementById('train-model')?.value || 'Qwen/Qwen3.5-27B';
       const epochs = parseInt(document.getElementById('train-epochs')?.value || '3');
       const lr = parseFloat(document.getElementById('train-lr')?.value || '0.0002');
       try {
@@ -1179,7 +1242,7 @@ INDEX_HTML = r"""<!doctype html>
       html+='<div class="small muted" style="margin-bottom:6px">Replayed from session start up to this turn. Includes terminal resize events.</div>';
       html+='<div id="slide-mode" class="small" style="margin-bottom:6px;color:#236c42">Mode: xterm replay</div>';
       html+='<div style="margin:0 0 8px 0;display:flex;gap:8px"><button onclick="slideTerminalScroll(\'top\')">Top</button><button onclick="slideTerminalScroll(\'up\')">PgUp</button><button onclick="slideTerminalScroll(\'down\')">PgDn</button><button onclick="slideTerminalScroll(\'bottom\')">Bottom</button></div>';
-      html+='<div id="slide-terminal" style="height:72vh;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:#fbfdfb"></div>';
+      html+='<div id="slide-terminal" style="height:calc(100vh - 140px);border:1px solid var(--border);border-radius:6px;overflow:hidden;background:#fbfdfb"></div>';
       html+='<div style="margin-top:8px"><button onclick="toggleSlideFallback()">Toggle Text Fallback</button></div>';
       html+='<div id="slide-fallback" style="display:none;margin-top:8px"><h3 style="margin:0 0 6px">Text Fallback</h3><pre class="mono" style="background:#f6f8f6;border:1px solid var(--border);border-radius:6px;padding:10px;overflow-x:auto;white-space:pre-wrap;font-size:11px;max-height:30vh;overflow-y:auto">'+esc(full)+'</pre></div>';
       document.getElementById('slide-content').innerHTML=html;
@@ -1211,6 +1274,10 @@ INDEX_HTML = r"""<!doctype html>
       attachTerminalWheelGuard(host);
       if (state.slideTermFit) {
         try { state.slideTermFit.fit(); } catch(e) {}
+        const ro = new ResizeObserver(() => {
+          try { if(state.slideTermFit) state.slideTermFit.fit(); } catch(e) {}
+        });
+        ro.observe(host);
       }
       state.slideTerm.focus();
       state.slideTerm.write('\x1b[2J\x1b[H');

@@ -13,7 +13,7 @@ Usage (inside container, multi-GPU):
     pip install peft trl datasets accelerate
     python3 train_proxy.py --data /data/train.jsonl --output /data/proxy_lora
 
-For 14B on 4x V100: loads in fp16 across GPUs via device_map="auto".
+For 27B on 4x V100: loads in fp16 across GPUs via device_map="auto".
 """
 import argparse
 import json
@@ -83,8 +83,8 @@ def build_sft_examples(data_path: str) -> list[dict]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True, help="Training JSONL file")
-    parser.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct",
-                        help="Base model (default: Qwen 14B)")
+    parser.add_argument("--model", default="Qwen/Qwen3.5-27B",
+                        help="Base model (default: Qwen 27B)")
     parser.add_argument("--output", default="/data/proxy_lora",
                         help="Output directory for LoRA adapter")
     parser.add_argument("--epochs", type=int, default=3)
@@ -142,7 +142,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Multi-GPU: load in fp16 spread across GPUs via device_map="auto"
-    # 14B fp16 = ~28GB, across 4x V100 32GB = ~7GB per GPU, plenty of room
+    # 27B fp16 = ~28GB, across 4x V100 32GB = ~7GB per GPU, plenty of room
     # No quantization needed — simpler and avoids BnB multi-GPU issues
     if n_gpus > 1:
         # Limit visible GPUs if requested
