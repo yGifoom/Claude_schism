@@ -666,14 +666,23 @@ INDEX_HTML = r"""<!doctype html>
       if(state.refreshInFlight) return;
       state.refreshInFlight = true;
       try {
-        await fetchSessions();
+        // Update sessions list silently (don't re-render unless count changed)
+        try {
+          const r0=await apiGet('/api/sessions');
+          const newSessions=await r0.json();
+          if(newSessions.length !== state.sessions.length) {
+            state.sessions=newSessions;
+            renderSessions();
+          } else {
+            state.sessions=newSessions;
+          }
+        } catch(e){}
+
         if(state.activeTab==='terminal' && state.selectedId && state.term && state.terminalSessionId===state.selectedId) {
           await refreshTerminalIncremental();
         }
         if(state.selectedId) {
           try {
-            const oldTop = window.scrollY;
-            const wasNearBottom = (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 24);
             const r=await apiGet('/api/sessions/'+state.selectedId);
             const newData=await r.json();
             const newFp=getDataFingerprint(newData);
@@ -681,15 +690,18 @@ INDEX_HTML = r"""<!doctype html>
             state.sessionData=newData;
             if(changed) {
               state.sessionFingerprint=newFp;
-              // Avoid tearing down xterm while user is scrolling terminal replay.
               if(state.activeTab==='terminal' && state.term && state.terminalSessionId===state.selectedId) {
-                // Keep existing terminal; we already did incremental refresh above.
+                // Keep existing terminal; incremental refresh already done above.
               } else {
+                // Save scroll, re-render, restore in same animation frame
+                const savedY = window.scrollY;
+                const wasBottom = (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 24);
                 renderWorkspace();
+                requestAnimationFrame(() => {
+                  if(wasBottom) window.scrollTo(0, document.documentElement.scrollHeight);
+                  else window.scrollTo(0, savedY);
+                });
               }
-              // Restore scroll position — only auto-scroll if user was at bottom
-              if(wasNearBottom) window.scrollTo(0, document.documentElement.scrollHeight);
-              else window.scrollTo(0, oldTop);
             }
           } catch(e){}
         }
@@ -925,11 +937,10 @@ INDEX_HTML = r"""<!doctype html>
 
     // ── Evolve tab ──
     function renderEvolve() {
+      const savedScrollY = window.scrollY;
       const el=document.getElementById('details');
       if(!state.selectedId) { el.innerHTML='<div class="content muted">Select a session.</div>'; return; }
-      const prevList = document.getElementById('evolve-list');
-      const prevTop = prevList ? prevList.scrollTop : 0;
-      const prevNearBottom = !!(prevList && (prevList.scrollTop + prevList.clientHeight) >= (prevList.scrollHeight - 12));
+      // scroll is saved inside renderEvolve itself
       Promise.all([
         apiGet('/api/evolves/'+state.selectedId).then(r=>r.json()),
         apiGet('/api/evaluator/'+state.selectedId).then(r=>r.json()),
@@ -969,10 +980,11 @@ INDEX_HTML = r"""<!doctype html>
           html+='<div class="muted">No evolve runs yet. Use <code>!evolve N</code> in procy.</div>';
           html+='</div>';
           el.innerHTML=html;
+          requestAnimationFrame(() => window.scrollTo(0, savedScrollY));
           return;
         }
         html+=`<div class="row" style="margin-bottom:8px"><b>Evolve Tries (${evolves.length})</b></div>`;
-        html+='<div id="evolve-list" style="max-height:calc(100vh - 400px);overflow-y:auto;padding-right:4px">';
+        html+='<div id="evolve-list">';
 
         // Match eval results to evolve iterations
         const evalByIter = {};
@@ -1023,11 +1035,7 @@ INDEX_HTML = r"""<!doctype html>
         });
         html+='</div></div>';
         el.innerHTML=html;
-        const nextList = document.getElementById('evolve-list');
-        if(nextList && prevList) {
-          if(prevNearBottom) nextList.scrollTop = nextList.scrollHeight;
-          else nextList.scrollTop = Math.min(prevTop, Math.max(0, nextList.scrollHeight - nextList.clientHeight));
-        }
+        requestAnimationFrame(() => window.scrollTo(0, savedScrollY));
       });
     }
 
@@ -1041,6 +1049,7 @@ INDEX_HTML = r"""<!doctype html>
 
     // ── Corrections tab ──
     function renderCorrections() {
+      const savedScrollY = window.scrollY;
       const el=document.getElementById('details');
       const qs = (!state.showAllCorrections && state.selectedId)
         ? `?session_id=${encodeURIComponent(state.selectedId)}`
@@ -1067,6 +1076,7 @@ INDEX_HTML = r"""<!doctype html>
         }
         html+='</div>';
         el.innerHTML=html;
+        requestAnimationFrame(() => window.scrollTo(0, savedScrollY));
       });
     }
 
@@ -1096,6 +1106,7 @@ INDEX_HTML = r"""<!doctype html>
 
     // ── Training tab ──
     function renderTraining() {
+      const savedScrollY = window.scrollY;
       const el=document.getElementById('details');
       Promise.all([
         apiGet('/api/training/all').then(r=>r.json()),
@@ -1159,6 +1170,7 @@ INDEX_HTML = r"""<!doctype html>
         }
         html+='</div>';
         el.innerHTML=html;
+        requestAnimationFrame(() => window.scrollTo(0, savedScrollY));
       });
     }
 

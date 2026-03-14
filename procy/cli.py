@@ -1564,6 +1564,7 @@ class Procy:
                     text=True, cwd=self.cwd, env=env,
                 )
                 output_lines = []
+                last_status_at = 0
                 while True:
                     line = proc.stdout.readline()
                     if not line and proc.poll() is not None:
@@ -1572,6 +1573,13 @@ class Procy:
                         output_lines.append(line)
                         log_f.write(line)
                         log_f.flush()
+                        # Show live output (throttled to avoid flooding)
+                        now = time.time()
+                        if now - last_status_at > 0.5:
+                            stripped = line.strip()
+                            if stripped:
+                                _dim(f"  eval: {stripped[:120]}")
+                            last_status_at = now
                     elapsed = time.time() - start
                     if elapsed > 600:
                         proc.kill()
